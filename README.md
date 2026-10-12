@@ -190,7 +190,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ZBM_TIMEOUT` | `10` | Countdown before booting `bootfs` |
 | `ZBM_FALLBACK` | `yes` | Also install to `EFI/BOOT/BOOTX64.EFI` |
 | `ENCRYPTION_ALGO` | `aes-256-gcm` | |
-| `POOL_COMPAT` | *(empty)* | Set to `openzfs-2.3-linux` to pin feature flags |
+| `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.4-linux` with backports, `openzfs-2.3-linux` without; `off` disables the pin |
 
 > **`ZBM_CMDLINE` and `KERNEL_CMDLINE` are not the same thing.** The first configures ZFSBootMenu's own kernel (what you see while it imports the pool and asks for the passphrase). The second is stored in `org.zfsbootmenu:commandline` and configures Debian. Conflating them is the most common mistake with this setup.
 
@@ -310,26 +310,29 @@ base Trixie and omit the backports source.
 
 ### Order matters
 
-ZFSBootMenu ships its own ZFS. **`zpool upgrade` is irreversible, and a ZBM image that predates a newly enabled feature flag cannot import the pool.** Follow this order:
+By default the pool compatibility follows the selected ZFS package track:
+`openzfs-2.4-linux` with backports, or `openzfs-2.3-linux` with base Trixie.
+ZFSBootMenu v3.1.0 embeds OpenZFS 2.4 and can import either. This prevents a
+routine OS-side `zpool upgrade` from enabling flags that the boot environment
+cannot read. `POOL_COMPAT=off` removes this safety rail entirely.
 
-1. **Install the newer ZFS in the OS:**
+When moving to a future OpenZFS release, follow this order:
+
+1. **Refresh ZFSBootMenu first.** Replace every release, recovery, backup and
+   `EFI/BOOT/BOOTX64.EFI` image you may rely on with a verified ZBM release that
+   embeds the target OpenZFS version.
+2. **Boot through a new image** and prove that it imports the pool and boots the OS.
+3. **Confirm the OS has the matching profile**, then deliberately move the pin
+   and enable its feature flags:
    ```bash
-   sudo apt install -t trixie-backports zfs-dkms zfsutils-linux zfs-initramfs
-   sudo update-initramfs -c -k all
-   ```
-   Reboot; confirm both userland and kmod report the new version with `zfs version`.
-
-2. **Refresh ZFSBootMenu first.** Check which ZFS version a release embeds at
-   [zbm-dev/zfsbootmenu/releases](https://github.com/zbm-dev/zfsbootmenu/releases), then download it.
-
-3. **Reboot through the new ZBM image** and confirm it still imports the pool and boots. *Only then:*
-   ```bash
+   target=openzfs-2.5-linux
+   test -r "/usr/share/zfs/compatibility.d/${target}"
+   sudo zpool set compatibility="$target" zroot
    sudo zpool upgrade zroot
    ```
 
-Note that once the pool is upgraded, `VMLINUZ-BACKUP.EFI` stops being a usable fallback unless it too has been refreshed.
-
-The script creates the pool with **no `compatibility=` pin**, so it has every feature flag the installing ZFS supports. Set `POOL_COMPAT=openzfs-2.3-linux` at install time if you'd rather have the guide's conservative default.
+`zpool upgrade` is irreversible. Once the compatibility profile moves forward,
+any older ZBM image that lacks those features is no longer a usable fallback.
 
 ---
 

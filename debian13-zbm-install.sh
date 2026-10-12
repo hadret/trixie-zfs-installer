@@ -223,6 +223,7 @@ ASHIFT="${ASHIFT:-12}"
 COMPRESSION="${COMPRESSION:-lz4}"
 ENCRYPTION_ALGO="${ENCRYPTION_ALGO:-aes-256-gcm}"
 DATASET_TUNING="${DATASET_TUNING:-yes}"
+POOL_COMPAT="${POOL_COMPAT:-}"
 
 #--- Identity -----------------------------------------------------------------
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-debian-zbm}"
@@ -319,6 +320,22 @@ list_disks() {
 [[ $EUID -eq 0 ]] || die "Run this script as root (sudo -i)."
 [[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
 
+# Keep pool feature flags within the OpenZFS version embedded in ZFSBootMenu.
+# Unknown ZBM releases require an explicit profile: guessing here can make the
+# pool unbootable after a future zpool upgrade.
+if [[ -z "$POOL_COMPAT" ]]; then
+	case "$ZBM_VERSION" in
+		v3.1.0)
+			if [[ "$ENABLE_BACKPORTS" == "yes" ]]; then
+				POOL_COMPAT="openzfs-2.4-linux"
+			else
+				POOL_COMPAT="openzfs-2.3-linux"
+			fi
+			;;
+		*) die "POOL_COMPAT must be set explicitly for ZFSBootMenu ${ZBM_VERSION}." ;;
+	esac
+fi
+
 if [[ -z "$DISK" ]]; then
 	list_disks
 	die "DISK is not set. Pass a /dev/disk/by-id/... path."
@@ -355,6 +372,9 @@ case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minim
 case "$BASELINE_MODE" in clone|send|none)  ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE"     in random|luks|none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
 case "$ENABLE_BACKPORTS" in yes|no)          ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
+if [[ "$POOL_COMPAT" != "off" && ! "$POOL_COMPAT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+	die "POOL_COMPAT contains invalid characters: ${POOL_COMPAT}"
+fi
 
 BPO=()
 [[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
@@ -458,6 +478,7 @@ cat <<EOF
   Swap             : $( [[ "$SWAP_MODE" != none ]] && echo "${SWAP_DEVICE}   ${SWAP_SIZE_MIB} MiB  mode=${SWAP_MODE}" || echo "disabled" )
   Pool vdev        : ${POOL_DEVICE}
   Pool             : ${POOL_NAME}  ashift=${ASHIFT}  compression=${COMPRESSION}
+  Compatibility    : ${POOL_COMPAT}
   Encryption       : ${ENCRYPTION_ALGO}, native, passphrase (mandatory)
   Boot environment : ${POOL_NAME}/ROOT/${BE_NAME}
   Baseline BE      : $( [[ "$BASELINE_MODE" == none ]] && echo "disabled" || echo "${POOL_NAME}/ROOT/${BASELINE_NAME} (${BASELINE_MODE})" )
@@ -562,6 +583,11 @@ log "Installing ZFS and helpers in the live environment (DKMS build, be patient)
 apt install -y debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates
 apt install -y "${BPO[@]}" zfsutils-linux zfs-dkms
 modprobe zfs || die "zfs module failed to load in the live environment."
+
+if [[ "$POOL_COMPAT" != "off" \
+	&& ! -r "/usr/share/zfs/compatibility.d/${POOL_COMPAT}" ]]; then
+	die "ZFS compatibility profile '${POOL_COMPAT}' is unavailable. Choose a profile from /usr/share/zfs/compatibility.d, or set POOL_COMPAT=off. With ENABLE_BACKPORTS=no on Trixie, use openzfs-2.3-linux."
+fi
 
 # [GUIDE] Generate /etc/hostid
 log "Generating /etc/hostid"
@@ -674,6 +700,9 @@ zpool_opts=(
 	-O keyformat=passphrase
 	-o autotrim=on
 )
+if [[ "$POOL_COMPAT" != "off" ]]; then
+	zpool_opts+=(-o "compatibility=${POOL_COMPAT}")
+fi
 zpool create "${zpool_opts[@]}" -m none "$POOL_NAME" "$POOL_DEVICE"
 
 # A pool's GUID is unique and unambiguous where its name is not. Everything
@@ -1679,14 +1708,20 @@ NEW USERS
     sudo chown -R NAME:NAME /home/NAME && sudo chmod 0750 /home/NAME
     sudo passwd NAME
 
-POOL UPGRADES
-  ZFSBootMenu ${ZBM_VERSION} images embed OpenZFS 2.4.0. Upgrade the OS first,
-  then enable only the feature flags supported by that installed ZFS version:
-    sudo apt update && sudo apt upgrade
-    sudo update-initramfs -c -k all
-    # reboot, confirm 'zfs version', then:
-    sudo zpool upgrade ${POOL_NAME}
-  If you later replace these images with an OLDER ZBM release, do it before,
-  not after, any zpool upgrade.
+POOL COMPATIBILITY
+  Current profile: ${POOL_COMPAT}
+  ZFSBootMenu ${ZBM_VERSION} images embed OpenZFS 2.4.0.
+
+  To move the pool to a future OpenZFS profile:
+    1. Replace every release, recovery, backup and BOOTX64 ZBM image first.
+    2. Boot through a new image and prove it imports this pool.
+    3. Confirm the OS provides the target profile, then run:
+
+       target=openzfs-2.5-linux
+       test -r "/usr/share/zfs/compatibility.d/\${target}"
+       sudo zpool set compatibility="\${target}" ${POOL_NAME}
+       sudo zpool upgrade ${POOL_NAME}
+
+  Never advance compatibility until every ZBM image you might boot supports it.
 
 EOF
