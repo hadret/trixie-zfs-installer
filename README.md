@@ -9,7 +9,7 @@ The script:
 - build the **same dataset hierarchy** with separate datasets for `/home`, `/root`, `/opt`, `/srv`, `/var/log`, `/var/spool`, `/var/tmp` and the container/VM stores
 - create a `default` and a `baseline` boot environment
 - install a **1 GiB encrypted swap partition** with a fresh random key each boot
-- install KDE, GNOME, or nothing, selected by an environment variable
+- install **Cinnamon** (the base for [OhMyDebn](https://github.com/dougburks/ohmydebn)), minimal or full, or nothing — with LightDM autologin for the admin user on encrypted installs
 - install CPU microcode and a broad firmware set (including `firmware-iwlwifi`)
 - leave boot messages **visible** — `quiet` is not set anywhere
 
@@ -86,7 +86,7 @@ DISK=/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S1A2B3C4 \
 TARGET_HOSTNAME=workstation \
 ADMIN_USER=alireza \
 TIMEZONE=Europe/Berlin \
-DESKTOP=kde \
+DESKTOP=minimal \
 ./debian13-zbm-install.sh
 ```
 
@@ -164,8 +164,8 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `LOCALE` | `en_US.UTF-8` | Must be UTF-8; `en_US.UTF-8` generated regardless |
 | `KEYMAP` | inherited from live ISO | Validated against the XKB rules list |
 | `KEYBOARD_VARIANT` | inherited from live ISO | Empty = standard layout. Pass `KEYBOARD_VARIANT=` to force none |
-| `DESKTOP` | `kde` | `kde`, `gnome`, `none` |
-| `DESKTOP_SIZE` | `minimal` | `minimal` or `full` |
+| `DESKTOP` | `minimal` | Cinnamon `minimal` or `full`, or `none` for headless |
+| `AUTOLOGIN` | `yes` if encrypted | LightDM autologin for `ADMIN_USER`. **Forced to `no` on unencrypted pools**; with encryption, the ZBM passphrase already gates the machine |
 | `SWAP_SIZE_MIB` | `1024` | `0` disables swap entirely |
 | `SWAP_RANDOM_SOURCE` | `/dev/urandom` | See [note on swap](#a-note-on-random-key-swap) |
 | `POOL_NAME` | `zroot` | |
@@ -185,7 +185,6 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `LIST_KEYBOARD` | — | List variants and exit |
 | `ESP_SIZE_MIB` | `1024` | |
 | `SWAP_MODE` | `random` | `random`, `luks`, `none` |
-| `ZBM_INSTALL` | `prebuilt` | `prebuilt` (download the EFI) or `source` (build with `generate-zbm`) |
 | `ZBM_CMDLINE` | `loglevel=6` | ZFSBootMenu's **own** kernel command line |
 | `KERNEL_CMDLINE` | `loglevel=6 systemd.show_status=yes` | What ZBM passes to Debian |
 | `ZBM_TIMEOUT` | `10` | Countdown before booting `bootfs` |
@@ -260,11 +259,32 @@ sudo passwd NAME
 
 ### Updating ZFSBootMenu
 
+Choose the release and kernel series you want to replace, then verify the
+signed checksum manifest and the EFI image before installing it. The installer
+leaves the ZFSBootMenu public key at `/etc/signify/zfsbootmenu.pub`.
+
 ```bash
-sudo curl -fSL -o /boot/efi/EFI/ZBM/VMLINUZ.EFI https://get.zfsbootmenu.org/efi
+version=v3.1.0
+kernel=6.12
+asset="zfsbootmenu-release-x86_64-${version}-linux${kernel}.EFI"
+base="https://github.com/zbm-dev/zfsbootmenu/releases/download/${version}"
+tmpdir="$(mktemp -d)"
+
+curl -fSL -o "${tmpdir}/sha256.txt" "${base}/sha256.txt"
+curl -fSL -o "${tmpdir}/sha256.sig" "${base}/sha256.sig"
+curl -fSL -o "${tmpdir}/${asset}" "${base}/${asset}"
+
+signify-openbsd -V -p /etc/signify/zfsbootmenu.pub \
+  -x "${tmpdir}/sha256.sig" -m "${tmpdir}/sha256.txt"
+(cd "$tmpdir" && signify-openbsd -C \
+  -p /etc/signify/zfsbootmenu.pub -x sha256.sig "$asset")
+
+sudo install -m 0644 "${tmpdir}/${asset}" \
+  "/boot/efi/EFI/ZBM-${kernel}/vmlinuz.EFI"
+rm -r -- "$tmpdir"
 ```
 
-Leave `VMLINUZ-BACKUP.EFI` alone as your known-good image.
+Boot the new image successfully before replacing any backup or recovery image.
 
 ### Cleanup
 

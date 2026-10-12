@@ -85,6 +85,10 @@
 
 set -euo pipefail
 
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+ZBM_PUBKEY_SOURCE="${SCRIPT_DIR}/releng/zfsbootmenu.pub"
+
 #==============================================================================
 # Keyboard detection from the live environment
 #==============================================================================
@@ -333,6 +337,18 @@ fi
 
 DISK_REAL="$(readlink -f "$DISK")"
 [[ "$(lsblk -dno TYPE "$DISK_REAL")" == "disk" ]] || die "${DISK} does not resolve to a whole disk."
+
+SECURE_BOOT_EFIVAR="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+# EFI variables start with a four-byte attributes field. The following byte is
+# the SecureBoot value: 1 means enabled. A missing variable means the firmware
+# does not expose Secure Boot and is not an error for this installer.
+if [[ -r "$SECURE_BOOT_EFIVAR" ]] \
+	&& [[ "$(od -An -tu1 -j4 -N1 "$SECURE_BOOT_EFIVAR" | tr -d '[:space:]')" == "1" ]]; then
+	die "Secure Boot is enabled. The unsigned ZFSBootMenu EFI images will not boot; disable Secure Boot and retry."
+fi
+
+[[ -r "$ZBM_PUBKEY_SOURCE" ]] \
+	|| die "Missing vendored ZFSBootMenu signing key: ${ZBM_PUBKEY_SOURCE}"
 
 case "$DESKTOP"       in kde|gnome|none)   ;; *) die "DESKTOP must be kde, gnome or none." ;; esac
 case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minimal or full." ;; esac
@@ -786,6 +802,7 @@ mount -t efivarfs efivarfs /mnt/sys/firmware/efi/efivars 2>/dev/null || \
 log "Writing chroot payload"
 
 gen_sources target > /mnt/root/sources.list.new
+install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 
 {
 	printf 'POOL_NAME=%q\n'              "$POOL_NAME"
@@ -853,6 +870,13 @@ die() {
 }
 
 export DEBIAN_FRONTEND=noninteractive
+
+# The ZFS key under /etc/zfs is included in every initramfs. Set this before
+# installing a kernel or initramfs-tools so even package-triggered images are
+# created root-only, not with Debian's usual world-readable mode.
+install -d -m 0755 /etc/initramfs-tools/conf.d
+printf 'UMASK=0077\n' > /etc/initramfs-tools/conf.d/umask.conf
+chmod 0644 /etc/initramfs-tools/conf.d/umask.conf
 
 # Install only the packages that actually exist in the archive. Debian renames
 # and splits packages between releases (firmware and font packages especially),
@@ -965,6 +989,11 @@ systemctl enable zfs-zed
 log "Rebuilding initramfs"
 update-initramfs -c -k all
 
+if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
+	&& [[ -n "$_insecure_initrd" ]]; then
+	die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
+fi
+
 #--- Encrypted swap -----------------------------------------------------------
 if [[ "$SWAP_MODE" != "none" ]]; then
 	log "Configuring encrypted swap (${SWAP_MODE})"
@@ -1046,6 +1075,11 @@ if [[ "${CSI_INSTALLED:-no}" == "yes" || "${SWAP_MODE:-none}" != "none" ]]; then
 	update-initramfs -u -k all
 fi
 
+if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
+	&& [[ -n "$_insecure_initrd" ]]; then
+	die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
+fi
+
 # The swap volume must NOT end up inside the initramfs. Its keyfile lives on the
 # root filesystem, which is not mounted that early, so an included target would
 # fall back to prompting for a passphrase that does not exist -- and the boot
@@ -1089,26 +1123,52 @@ mount /boot/efi
 # ZFSBootMenu images
 #==============================================================================
 
-log "Downloading ZFSBootMenu ${ZBM_VERSION} images"
-apt install -y -t trixie-backports curl 
-apt install -y ca-certificates
+log "Downloading and verifying ZFSBootMenu ${ZBM_VERSION} images"
+apt install -y ca-certificates curl signify-openbsd
+
+ZBM_DOWNLOAD_DIR="/root/zfsbootmenu-${ZBM_VERSION}"
+ZBM_SIGNIFY_KEY="/etc/signify/zfsbootmenu.pub"
+ZBM_RELEASE_URL="${ZBM_BASE_URL}/${ZBM_VERSION}"
+install -d -m 0700 "$ZBM_DOWNLOAD_DIR"
+
+download_zbm_asset() {
+	local name="$1" dest="${ZBM_DOWNLOAD_DIR}/${1}" part="${ZBM_DOWNLOAD_DIR}/${1}.part"
+	rm -f "$part"
+	curl -fSL --retry 3 --retry-delay 2 -o "$part" "${ZBM_RELEASE_URL}/${name}" \
+		|| { rm -f "$part"; return 1; }
+	mv "$part" "$dest"
+}
+
+download_zbm_asset sha256.txt || die "Could not download ${ZBM_RELEASE_URL}/sha256.txt"
+download_zbm_asset sha256.sig || die "Could not download ${ZBM_RELEASE_URL}/sha256.sig"
+
+# -V proves that sha256.txt is exactly the manifest signed by the vendored key.
+# -C below then authenticates each downloaded EFI against that signed manifest.
+signify-openbsd -V -p "$ZBM_SIGNIFY_KEY" \
+	-x "${ZBM_DOWNLOAD_DIR}/sha256.sig" \
+	-m "${ZBM_DOWNLOAD_DIR}/sha256.txt" \
+	|| die "ZFSBootMenu ${ZBM_VERSION} checksum manifest signature is invalid."
 
 # fetch_zbm <build> <kernel> <destination>
 #   build = release | recovery
 fetch_zbm() {
 	local build="$1" kern="$2" dest="$3"
 	local fname="zfsbootmenu-${build}-x86_64-${ZBM_VERSION}-linux${kern}.EFI"
-	local url="${ZBM_BASE_URL}/${ZBM_VERSION}/${fname}"
-	local tmp="/root/${fname}"
+	local url="${ZBM_RELEASE_URL}/${fname}"
+	local tmp="${ZBM_DOWNLOAD_DIR}/${fname}"
 
 	if [[ ! -f "$tmp" ]]; then
 		echo "  fetching ${fname}"
-		curl -fSL --retry 3 --retry-delay 2 -o "$tmp" "$url" \
-			|| { rm -f "$tmp"; echo "download failed: $url" >&2; return 1; }
+		download_zbm_asset "$fname" \
+			|| { echo "download failed: $url" >&2; return 1; }
+	fi
+	if ! (cd "$ZBM_DOWNLOAD_DIR" && signify-openbsd -C \
+		-p "$ZBM_SIGNIFY_KEY" -x sha256.sig "$fname"); then
+		rm -f "$tmp"
+		die "Signature or checksum verification failed for ${fname}."
 	fi
 
-	mkdir -p "$(dirname "$dest")"
-	cp "$tmp" "$dest"
+	install -D -m 0644 "$tmp" "$dest"
 	return 0
 }
 
@@ -1178,7 +1238,8 @@ fi
 # (you get the whole menu instead of one hard-wired image). Handled after
 # rEFInd is installed, further down.
 
-rm -f /root/zfsbootmenu-*.EFI
+find "$ZBM_DOWNLOAD_DIR" -maxdepth 1 -type f -delete
+rmdir "$ZBM_DOWNLOAD_DIR"
 
 #==============================================================================
 # [GUIDE] rEFInd
