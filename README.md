@@ -177,7 +177,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `DATASET_TUNING` | `yes` | |
 | `SUITE` / `MIRROR` | `trixie` / deb.debian.org | |
 | `COMPONENTS` | `main contrib non-free-firmware` | |
-| `ENABLE_BACKPORTS` | `yes` | Adds the repo unpinned; installs nothing from it |
+| `ENABLE_BACKPORTS` | `yes` | `yes` adds the repo with Debian's native policy and seeds ZFS from it; `no` uses base Trixie |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
 | `ROOT_PASSWORD` / `ADMIN_PASSWORD` / `ZFS_PASSPHRASE` | prompted | Passing these on the command line leaks them to `ps` |
@@ -302,7 +302,11 @@ If `BASELINE_MODE=clone`, the `@baseline` snapshot **cannot** be destroyed while
 
 ## Upgrading OpenZFS and the pool
 
-The script adds `trixie-backports` (unpinned, so nothing is pulled from it automatically).
+By default the script adds `trixie-backports` with Debian's native
+`NotAutomatic: yes` / `ButAutomaticUpgrades: yes` policy and explicitly installs
+ZFS from it once. Future ZFS updates from backports are then selected normally,
+without pulling unrelated backports packages. Set `ENABLE_BACKPORTS=no` to use
+base Trixie and omit the backports source.
 
 ### Order matters
 

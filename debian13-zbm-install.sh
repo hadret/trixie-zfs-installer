@@ -246,11 +246,11 @@ COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
 
 ENABLE_UPDATES="${ENABLE_UPDATES:-yes}"       # ${SUITE}-updates
 ENABLE_SECURITY="${ENABLE_SECURITY:-yes}"     # ${SUITE}-security
-ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-yes}"    # enable later, by hand
+ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-yes}"   # Debian's native backports policy
 # ${SUITE}-proposed-updates holds packages QUEUED FOR THE NEXT POINT RELEASE.
-# Unlike backports it has NORMAL priority, so enabling it means apt WILL pull
-# from it on the next upgrade. That is the point of a testing rig, but know
-# what you are switching on.
+# It has normal priority, so enabling it means apt WILL pull from it on the next
+# upgrade. That is the point of a testing rig, but know what you are switching
+# on.
 ENABLE_PROPOSED_UPDATES="${ENABLE_PROPOSED_UPDATES:-no}"
 
 INSTALL_FIRMWARE="${INSTALL_FIRMWARE:-yes}"
@@ -354,6 +354,10 @@ case "$DESKTOP"       in kde|gnome|none)   ;; *) die "DESKTOP must be kde, gnome
 case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minimal or full." ;; esac
 case "$BASELINE_MODE" in clone|send|none)  ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE"     in random|luks|none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
+case "$ENABLE_BACKPORTS" in yes|no)          ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
+
+BPO=()
+[[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
 
 if [[ ! "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
 	die "ADMIN_USER '${ADMIN_USER}' is not a valid Unix username."
@@ -537,8 +541,7 @@ gen_sources() {
 
 	if [[ "$ENABLE_BACKPORTS" == "yes" ]]; then
 		echo
-		echo "# Backports. LOW priority: nothing installs from here unless you"
-		echo "# ask, e.g. apt install -t ${SUITE}-backports zfs-dkms"
+		echo "# Backports. Debian's native NotAutomatic/ButAutomaticUpgrades policy."
 		echo "deb ${MIRROR} ${SUITE}-backports ${COMPONENTS}"
 		[[ "$mode" == "target" ]] && echo "deb-src ${MIRROR} ${SUITE}-backports ${COMPONENTS}"
 	fi
@@ -557,7 +560,7 @@ apt update
 
 log "Installing ZFS and helpers in the live environment (DKMS build, be patient)"
 apt install -y debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates
-apt install -y -t trixie-backports zfsutils-linux zfs-dkms
+apt install -y "${BPO[@]}" zfsutils-linux zfs-dkms
 modprobe zfs || die "zfs module failed to load in the live environment."
 
 # [GUIDE] Generate /etc/hostid
@@ -819,6 +822,7 @@ install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 	printf 'KEYMAP=%q\n'                 "$KEYMAP"
 	printf 'KEYBOARD_VARIANT=%q\n'       "$KEYBOARD_VARIANT"
 	printf 'SUITE=%q\n'                  "$SUITE"
+	printf 'ENABLE_BACKPORTS=%q\n'       "$ENABLE_BACKPORTS"
 	printf 'INSTALL_FIRMWARE=%q\n'       "$INSTALL_FIRMWARE"
 	printf 'EXTRA_PACKAGES=%q\n'         "$EXTRA_PACKAGES"
 	printf 'DESKTOP=%q\n'                "$DESKTOP"
@@ -855,6 +859,9 @@ cat > /mnt/root/zbm-chroot.sh <<'CHROOT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /root/zbm-install.env
+
+BPO=()
+[[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
 
 WARNFILE=/root/INSTALL-WARNINGS.txt
 
@@ -943,7 +950,7 @@ dpkg-reconfigure -f noninteractive keyboard-configuration console-setup
 log "Installing kernel and ZFS"
 mkdir -p /etc/dkms
 apt install -y linux-headers-amd64 linux-image-amd64 dosfstools dkms
-apt install -y -t trixie-backports zfsutils-linux zfs-dkms  zfs-zed zfs-initramfs 
+apt install -y "${BPO[@]}" zfsutils-linux zfs-dkms zfs-zed zfs-initramfs
 echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
 
 #--- Microcode and firmware ---------------------------------------------------
@@ -1639,17 +1646,18 @@ APT SUITES ENABLED
   ${SUITE}$( [[ "$ENABLE_UPDATES" == yes ]] && echo ", ${SUITE}-updates" )$( [[ "$ENABLE_SECURITY" == yes ]] && echo ", ${SUITE}-security" )$( [[ "$ENABLE_PROPOSED_UPDATES" == yes ]] && echo ", ${SUITE}-proposed-updates" )$( [[ "$ENABLE_BACKPORTS" == yes ]] && echo ", ${SUITE}-backports" )
   Components: ${COMPONENTS}
 
-  Backports and proposed-updates are NOT enabled. Add them yourself when you
-  want them:
+  Backports follows Debian's native low-priority policy. When enabled, this
+  installer explicitly seeded ZFS from backports; future backports upgrades to
+  those installed packages are then selected automatically.
 
-    # Backports. LOW priority: nothing installs from it unless you ask.
+    # If backports was disabled, add its source and seed packages explicitly:
     echo "deb ${MIRROR} ${SUITE}-backports ${COMPONENTS}" \\
         | sudo tee /etc/apt/sources.list.d/${SUITE}-backports.list
     sudo apt update
-    # then, per package:
     sudo apt install -t ${SUITE}-backports zfs-dkms zfsutils-linux zfs-initramfs
 
-    # Proposed-updates: packages queued for the next point release.
+    # Proposed-updates is configured only when ENABLE_PROPOSED_UPDATES=yes.
+    # It contains packages queued for the next point release.
     # NORMAL priority -- once added, 'apt upgrade' WILL pull from it.
     echo "deb ${MIRROR} ${SUITE}-proposed-updates ${COMPONENTS}" \\
         | sudo tee /etc/apt/sources.list.d/${SUITE}-proposed-updates.list
@@ -1672,9 +1680,9 @@ NEW USERS
     sudo passwd NAME
 
 POOL UPGRADES
-  ZFSBootMenu ${ZBM_VERSION} images embed OpenZFS 2.4.0, so this pool can be
-  upgraded to 2.4 feature flags and every installed image will still import it:
-    sudo apt install -t ${SUITE}-backports zfs-dkms zfsutils-linux zfs-initramfs
+  ZFSBootMenu ${ZBM_VERSION} images embed OpenZFS 2.4.0. Upgrade the OS first,
+  then enable only the feature flags supported by that installed ZFS version:
+    sudo apt update && sudo apt upgrade
     sudo update-initramfs -c -k all
     # reboot, confirm 'zfs version', then:
     sudo zpool upgrade ${POOL_NAME}
