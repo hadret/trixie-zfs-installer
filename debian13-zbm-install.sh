@@ -116,6 +116,7 @@ BASELINE_NAME="${BASELINE_NAME:-baseline}"
 BASELINE_MODE="${BASELINE_MODE:-clone}"     # clone | send | none
 ASHIFT="${ASHIFT:-12}"
 COMPRESSION="${COMPRESSION:-lz4}"
+ENCRYPTION="${ENCRYPTION:-yes}"
 ENCRYPTION_ALGO="${ENCRYPTION_ALGO:-aes-256-gcm}"
 DATASET_TUNING="${DATASET_TUNING:-yes}"
 POOL_COMPAT="${POOL_COMPAT:-}"
@@ -314,12 +315,18 @@ case "$DESKTOP"       in kde|gnome|none)   ;; *) die "DESKTOP must be kde, gnome
 case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minimal or full." ;; esac
 case "$BASELINE_MODE" in clone|send|none)  ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE"     in random|luks|none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
+case "$ENCRYPTION"    in yes|no)           ;; *) die "ENCRYPTION must be yes or no." ;; esac
 case "$ENABLE_BACKPORTS" in yes|no)          ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
+[[ "$ENCRYPTION" == "no" || -z "$ZFS_PASSPHRASE" || ${#ZFS_PASSPHRASE} -ge 8 ]] \
+	|| die "ZFS_PASSPHRASE must be at least 8 characters."
 [[ "$SWAP_SIZE_MIB" =~ ^[0-9]+$ ]] || die "SWAP_SIZE_MIB must be a non-negative integer."
 SWAP_SIZE_MIB=$(( 10#$SWAP_SIZE_MIB ))
 if [[ "$SWAP_MODE" == "none" ]] || (( SWAP_SIZE_MIB == 0 )); then
 	SWAP_MODE="none"
 	SWAP_SIZE_MIB=0
+fi
+if [[ "$SWAP_MODE" == "luks" && "$ENCRYPTION" == "no" ]]; then
+	warn "SWAP_MODE=luks stores its key on the unencrypted root pool; it provides no offline confidentiality."
 fi
 if [[ "$POOL_COMPAT" != "off" && ! "$POOL_COMPAT" =~ ^[A-Za-z0-9._-]+$ ]]; then
 	die "POOL_COMPAT contains invalid characters: ${POOL_COMPAT}"
@@ -414,7 +421,8 @@ BOOT_DEVICE="${DISK}-part${BOOT_PART}"
 SWAP_DEVICE="${DISK}-part${SWAP_PART}"
 POOL_DEVICE="${DISK}-part${POOL_PART}"
 
-KEYFILE="/etc/zfs/${POOL_NAME}.key"
+KEYFILE=""
+[[ "$ENCRYPTION" == "yes" ]] && KEYFILE="/etc/zfs/${POOL_NAME}.key"
 
 log "Planned configuration"
 cat <<EOF
@@ -426,7 +434,7 @@ cat <<EOF
   Pool vdev        : ${POOL_DEVICE}
   Pool             : ${POOL_NAME}  ashift=${ASHIFT}  compression=${COMPRESSION}
   Compatibility    : ${POOL_COMPAT}
-  Encryption       : ${ENCRYPTION_ALGO}, native, passphrase (mandatory)
+  Encryption       : $( [[ "$ENCRYPTION" == yes ]] && echo "${ENCRYPTION_ALGO}, native, passphrase" || echo "disabled (data readable at rest)" )
   Boot environment : ${POOL_NAME}/ROOT/${BE_NAME}
   Baseline BE      : $( [[ "$BASELINE_MODE" == none ]] && echo "disabled" || echo "${POOL_NAME}/ROOT/${BASELINE_NAME} (${BASELINE_MODE})" )
 
@@ -466,7 +474,7 @@ fi
 log "Collecting passwords"
 [[ -n "$ROOT_PASSWORD" ]]  || prompt_pass ROOT_PASSWORD  "root password" 1
 [[ -n "$ADMIN_PASSWORD" ]] || prompt_pass ADMIN_PASSWORD "password for ${ADMIN_USER}" 1
-if [[ -z "$ZFS_PASSPHRASE" ]]; then
+if [[ "$ENCRYPTION" == "yes" && -z "$ZFS_PASSPHRASE" ]]; then
 	# [GUIDE] The pool passphrase must be typeable in ZFSBootMenu's minimal keymap.
 	echo "  Typed inside ZFSBootMenu at every boot, on a basic keymap."
 	echo "  Prefer unshifted ASCII you can find blind."
@@ -611,17 +619,19 @@ if zpool import 2>/dev/null | awk '$1 == "pool:" { print $2 }' | grep -qx "$POOL
 fi
 
 #==============================================================================
-# [GUIDE] ZFS pool creation (encrypted variant)
+# [GUIDE] ZFS pool creation
 #==============================================================================
 
-# [GUIDE] Create the key file referenced by the encrypted-pool step.
-log "Writing pool key to ${KEYFILE}"
-mkdir -p /etc/zfs
-LIVE_KEY_WRITTEN=yes
-printf '%s' "$ZFS_PASSPHRASE" > "$KEYFILE"
-chmod 000 "$KEYFILE"
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	# [GUIDE] Create the key file referenced by the encrypted-pool step.
+	log "Writing pool key to ${KEYFILE}"
+	mkdir -p /etc/zfs
+	LIVE_KEY_WRITTEN=yes
+	printf '%s' "$ZFS_PASSPHRASE" > "$KEYFILE"
+	chmod 000 "$KEYFILE"
+fi
 
-log "Creating encrypted zpool ${POOL_NAME} on ${POOL_DEVICE}"
+log "Creating zpool ${POOL_NAME} on ${POOL_DEVICE}"
 zpool_opts=(
 	-f
 	-o "ashift=${ASHIFT}"
@@ -630,11 +640,15 @@ zpool_opts=(
 	-O xattr=sa
 	-O relatime=off
 	-O atime=off
-	-O "encryption=${ENCRYPTION_ALGO}"
-	-O "keylocation=file://${KEYFILE}"
-	-O keyformat=passphrase
 	-o autotrim=on
 )
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	zpool_opts+=(
+		-O "encryption=${ENCRYPTION_ALGO}"
+		-O "keylocation=file://${KEYFILE}"
+		-O keyformat=passphrase
+	)
+fi
 if [[ "$POOL_COMPAT" != "off" ]]; then
 	zpool_opts+=(-o "compatibility=${POOL_COMPAT}")
 fi
@@ -705,7 +719,9 @@ if [[ "$IMPORTED_GUID" != "$POOL_GUID" ]]; then
 	die "Imported pool GUID '${IMPORTED_GUID}' does not match the pool just created ('${POOL_GUID}')."
 fi
 
-zfs load-key "$POOL_NAME"
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	zfs load-key "$POOL_NAME"
+fi
 zfs mount "${POOL_NAME}/ROOT/${BE_NAME}"
 zfs mount -a
 
@@ -735,8 +751,10 @@ log "Copying host files into the new install"
 mkdir -p /mnt/etc/zfs
 cp /etc/hostid /mnt/etc/
 cp /etc/resolv.conf /mnt/etc/
-cp "$KEYFILE" "/mnt${KEYFILE}"
-chmod 000 "/mnt${KEYFILE}"
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	cp "$KEYFILE" "/mnt${KEYFILE}"
+	chmod 000 "/mnt${KEYFILE}"
+fi
 
 log "Preparing chroot mounts"
 mount -t proc  proc  /mnt/proc
@@ -759,7 +777,7 @@ gen_sources target > /mnt/root/sources.list.new
 install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 
 INSTALL_ENV_WRITTEN=yes
-declare -p POOL_NAME BE_NAME KEYFILE TARGET_HOSTNAME ADMIN_USER ADMIN_FULLNAME \
+declare -p POOL_NAME BE_NAME ENCRYPTION KEYFILE TARGET_HOSTNAME ADMIN_USER ADMIN_FULLNAME \
 	ADMIN_GROUPS ROOT_PASSWORD ADMIN_PASSWORD TIMEZONE LOCALE KEYMAP \
 	KEYBOARD_VARIANT SUITE INSTALL_FIRMWARE EXTRA_PACKAGES DESKTOP DESKTOP_SIZE \
 	DESKTOP_EXTRAS INSTALL_MEDIA_ACCEL INSTALL_FLATPAK INSTALL_OFFICE \
@@ -790,9 +808,11 @@ die() {
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Set initramfs umask before package triggers can embed the ZFS key.
 install -d -m 0755 /etc/initramfs-tools/conf.d
-printf 'UMASK=0077\n' > /etc/initramfs-tools/conf.d/umask.conf
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	# Restrict initramfs permissions before package triggers can embed the ZFS key.
+	printf 'UMASK=0077\n' > /etc/initramfs-tools/conf.d/umask.conf
+fi
 printf 'RESUME=none\n' > /etc/initramfs-tools/conf.d/resume
 
 # Install only packages present in this suite's archive.
@@ -941,20 +961,24 @@ EOF
 	echo "/dev/mapper/${SWAP_MAPPER}	none	swap	sw,nofail,x-systemd.requires=systemd-cryptsetup@${SWAP_MAPPER}.service	0	0" >> /etc/fstab
 fi
 
-# [GUIDE] Build the final key-bearing initramfs after crypttab is complete.
+# [GUIDE] Build the final initramfs after crypttab is complete.
 log "Rebuilding final initramfs"
 update-initramfs -u -k all
 
-if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
-	&& [[ -n "$_insecure_initrd" ]]; then
-	die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
+		&& [[ -n "$_insecure_initrd" ]]; then
+		die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
+	fi
 fi
 #--- [GUIDE] ZFSBootMenu dataset properties -----------------------------------
 log "Setting ZFSBootMenu dataset properties"
 
 # Let ZFSBootMenu set spl_hostid; Debian already has /etc/hostid in initramfs.
 zfs set "org.zfsbootmenu:commandline=${KERNEL_CMDLINE}" "${POOL_NAME}/ROOT"
-zfs set "org.zfsbootmenu:keysource=${POOL_NAME}/ROOT/${BE_NAME}" "$POOL_NAME"
+if [[ "$ENCRYPTION" == "yes" ]]; then
+	zfs set "org.zfsbootmenu:keysource=${POOL_NAME}/ROOT/${BE_NAME}" "$POOL_NAME"
+fi
 zfs get -o property,value org.zfsbootmenu:commandline "${POOL_NAME}/ROOT"
 
 #--- [GUIDE] ESP filesystem and mount -----------------------------------------
@@ -1308,8 +1332,10 @@ umount -n -R /mnt || {
 sleep 2
 zpool export "$POOL_NAME"
 INSTALL_POOL_CREATED=no
-secure_remove_file "$KEYFILE"
-LIVE_KEY_WRITTEN=no
+if [[ "$LIVE_KEY_WRITTEN" == "yes" ]]; then
+	secure_remove_file "$KEYFILE"
+	LIVE_KEY_WRITTEN=no
+fi
 
 log "Done"
 cat <<EOF

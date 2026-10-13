@@ -1,10 +1,10 @@
 # trixie-zfs-installer
 
-An installer for **Debian 13 (Trixie) with root on encrypted ZFS**, booting via rEFInd → **ZFSBootMenu**, with `/boot` on the ZFS root dataset. It follows the [ZFSBootMenu — Debian (UEFI)](https://docs.zfsbootmenu.org/en/v3.1.x/guides/debian/uefi.html) guide.
+An installer for **Debian 13 (Trixie) with root on ZFS**, booting via rEFInd → **ZFSBootMenu**, with `/boot` on the ZFS root dataset. It follows the [ZFSBootMenu — Debian (UEFI)](https://docs.zfsbootmenu.org/en/v3.1.x/guides/debian/uefi.html) guide.
 
 The script:
 
-- use **ZFS native encryption** (`aes-256-gcm`, passphrase) — mandatory, not optional
+- use **ZFS native encryption** (`aes-256-gcm`, passphrase) by default, with an explicit unencrypted opt-out
 - require the disk to be given as a stable `/dev/disk/by-id/…` path
 - build the **same dataset hierarchy** with separate datasets for `/home`, `/root`, `/opt`, `/srv`, `/var/log`, `/var/spool`, `/var/tmp` and the container/VM stores
 - create a `default` and a `baseline` boot environment
@@ -40,7 +40,7 @@ Every step is tagged in the source with `[GUIDE]` (straight from the upstream do
 
 ### `debian13-zbm-install.sh` — ZFSBootMenu
 
-ZFSBootMenu is a small Linux+initramfs bundled into a single EFI executable. It imports your pool, asks for the passphrase, lists every boot environment and snapshot it can find, and `kexec`s into the one you choose.
+ZFSBootMenu is a small Linux+initramfs bundled into a single EFI executable. It imports your pool, asks for its passphrase when encrypted, lists every boot environment and snapshot it can find, and `kexec`s into the one you choose.
 
 **Why:** boot environments become a first-class, interactive feature: rolling back a bad upgrade is a menu selection at boot, not a rescue USB. You also get a snapshot browser, a diff viewer, a recovery shell, and pool health reporting before the OS ever starts.
 
@@ -90,7 +90,7 @@ DESKTOP=minimal \
 ./debian13-zbm-install.sh
 ```
 
-The script prints a full configuration summary, then requires you to type `ERASE` before touching the disk. Passwords are prompted interactively (root, admin user, ZFS passphrase) unless supplied as variables.
+The script prints a full configuration summary, then requires you to type `ERASE` before touching the disk. Passwords are prompted interactively (root, admin user, and the ZFS passphrase when encryption is enabled) unless supplied as variables.
 
 ### Not sure about the keyboard layout?
 
@@ -177,6 +177,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ASHIFT` | `12` | |
 | `COMPRESSION` | `lz4` | |
 | `DATASET_TUNING` | `yes` | |
+| `ENCRYPTION` | `yes` | `no` creates an unencrypted pool and does not prompt for or install a ZFS key |
 | `SUITE` / `MIRROR` | `trixie` / deb.debian.org | |
 | `COMPONENTS` | `main contrib non-free non-free-firmware` | |
 | `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites |
@@ -184,7 +185,8 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
-| `ROOT_PASSWORD` / `ADMIN_PASSWORD` / `ZFS_PASSPHRASE` | prompted | Passing these on the command line leaks them to `ps` |
+| `ROOT_PASSWORD` / `ADMIN_PASSWORD` | prompted | Passing these on the command line leaks them to `ps` |
+| `ZFS_PASSPHRASE` | prompted when encrypted | Ignored when `ENCRYPTION=no`; passing it on the command line leaks it to `ps` |
 | `FORCE` | `no` | `yes` skips **only** the `ERASE` confirmation |
 | `LIST_KEYBOARD` | — | List variants and exit |
 | `ESP_SIZE_MIB` | `2048` | |
@@ -361,7 +363,7 @@ From any Debian live ISO:
 sudo -i
 apt update && apt install -y zfsutils-linux
 zpool import -f -N -R /mnt POOL
-zfs load-key -a                        # or: zfs load-key POOL
+zfs load-key -a                        # encrypted pools only
 zfs mount POOL/ROOT/default
 zfs mount -a
 
@@ -390,8 +392,8 @@ If the script recorded problems during installation, they are kept at `/root/INS
 The script is annotated inline, but the ones worth knowing up front:
 
 - **2048 MiB ESP** instead of 512, leaving room for several ZBM images and rEFInd.
-- **The pool key file is created.** The guide's encrypted `zpool create` references `/etc/zfs/zroot.key` as a file "created in a previous step" — but the Debian page never shows that step. The script creates it before `zpool create`.
-- **Encrypted export/import is spelled out.** The guide's encrypted tab omits it; the script does `zpool export` → `zpool import -N -R /mnt` → `zfs load-key` → mount, which is what the other guides in the same series actually do.
+- **The pool key file is created for encrypted installs.** The guide's encrypted `zpool create` references `/etc/zfs/zroot.key` as a file "created in a previous step" — but the Debian page never shows that step. The script creates it before `zpool create`.
+- **Export/import is spelled out.** The script always does `zpool export` → `zpool import -N -R /mnt` → mount; encrypted installs additionally run `zfs load-key` before mounting. The guide's encrypted tab omits this sequence, while the other guides in the same series include it.
 - **The vdev is referenced by PARTUUID**, so the pool doesn't care about device enumeration order.
 - **`EFI/BOOT/BOOTX64.EFI` fallback**, for firmware that silently drops NVRAM boot entries. The guide flags this problem and links to its Portable ZFSBootMenu page but doesn't automate it.
 - **Verbose command lines**, microcode, expanded firmware, and `zfs-zed` — none of which the guide covers.
@@ -403,7 +405,8 @@ The script is annotated inline, but the ones worth knowing up front:
 - **This script erases an entire disk.** It is not for dual-booting. Back up first.
 - `FORCE=yes` skips **only** the `ERASE` confirmation. It does not skip password prompts, and all preflight validation still runs.
 - Test in a VM before running on hardware you care about. For QEMU/KVM, set a unique serial on each virtual disk so `/dev/disk/by-id` aliases appear.
-- **Your passphrase is likely the weakest link.** It is typed inside ZBM, which uses a basic keymap — prefer unshifted ASCII you can type blind.
+- `ENCRYPTION=no` leaves the root pool, home directories, logs, and any persistent swap keyfiles readable at rest. Use it only when disk confidentiality is intentionally out of scope.
+- **Your passphrase is likely the weakest link.** On encrypted installs it is typed inside ZBM, which uses a basic keymap — prefer unshifted ASCII you can type blind.
 
 ### A note on random-key swap
 
@@ -411,7 +414,7 @@ The swap partition uses **plain dm-crypt with a fresh key drawn from `/dev/urand
 
 This is *not* LUKS, and cannot be: LUKS requires a persistent header with keyslots, which is incompatible with a per-boot random key. The consequence is that **hibernation is impossible**, which is why `RESUME=none` is configured.
 
-If you need hibernation, the script offers `SWAP_MODE=luks` — a persistent LUKS2 volume unlocked from a keyfile on the encrypted root. Note that the script does not configure a resume device; that is left to you.
+If you need hibernation, the script offers `SWAP_MODE=luks` — a persistent LUKS2 volume unlocked from a keyfile on the root pool. On an unencrypted pool that key is itself readable at rest, so LUKS swap provides no offline confidentiality. The script does not configure a resume device; that is left to you.
 
 `/dev/urandom` is the default rather than `/dev/random` because they are cryptographically identical on modern kernels and `/dev/urandom` never blocks. Set `SWAP_RANDOM_SOURCE=/dev/random` if you prefer.
 
