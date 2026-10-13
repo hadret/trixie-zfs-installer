@@ -108,7 +108,7 @@ An empty `KEYBOARD_VARIANT` is normal and correct for most people — it means t
 
 | Part | Size | Type | Purpose |
 |---|---|---|---|
-| 1 | 1024 MiB | `ef00` | ESP → `/boot/efi`, holds rEFInd + ZFSBootMenu |
+| 1 | 2048 MiB | `ef00` | ESP → `/boot/efi`, holds rEFInd + ZFSBootMenu |
 | 2 | 1024 MiB | `8200` / `8309` | random-key dm-crypt (default) / LUKS2 swap |
 | 3 | rest − 10 MiB | `bf00` | `zroot` |
 
@@ -185,7 +185,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ROOT_PASSWORD` / `ADMIN_PASSWORD` / `ZFS_PASSPHRASE` | prompted | Passing these on the command line leaks them to `ps` |
 | `FORCE` | `no` | `yes` skips **only** the `ERASE` confirmation |
 | `LIST_KEYBOARD` | — | List variants and exit |
-| `ESP_SIZE_MIB` | `1024` | |
+| `ESP_SIZE_MIB` | `2048` | |
 | `SWAP_MODE` | `random` | `random`, `luks`, `none`; `none` omits the partition and normalizes its size to `0` |
 | `ZBM_CMDLINE` | `loglevel=6` | ZFSBootMenu's **own** kernel command line |
 | `KERNEL_CMDLINE` | `loglevel=6 systemd.show_status=yes` | What ZBM passes to Debian |
@@ -374,7 +374,7 @@ If the script recorded problems during installation, they are kept at `/root/INS
 
 The script is annotated inline, but the ones worth knowing up front:
 
-- **1024 MiB ESP** instead of 512, leaving room for several ZBM images and rEFInd.
+- **2048 MiB ESP** instead of 512, leaving room for several ZBM images and rEFInd.
 - **The pool key file is created.** The guide's encrypted `zpool create` references `/etc/zfs/zroot.key` as a file "created in a previous step" — but the Debian page never shows that step. The script creates it before `zpool create`.
 - **Encrypted export/import is spelled out.** The guide's encrypted tab omits it; the script does `zpool export` → `zpool import -N -R /mnt` → `zfs load-key` → mount, which is what the other guides in the same series actually do.
 - **The vdev is referenced by PARTUUID**, so the pool doesn't care about device enumeration order.
