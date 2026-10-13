@@ -150,10 +150,15 @@ INSTALL_FIRMWARE="${INSTALL_FIRMWARE:-yes}"
 EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 
 #--- Desktop ------------------------------------------------------------------
-DESKTOP="${DESKTOP:-kde}"                 # kde | gnome | none
-DESKTOP_SIZE="${DESKTOP_SIZE:-minimal}"   # minimal | full
-# The "works like a normal desktop" layer: audio, bluetooth, printing, mounting,
-# codecs, fonts, archives, firmware updates. Debian does not pull these in with
+DESKTOP="${DESKTOP:-minimal}" # minimal | full | none (Cinnamon)
+AUTOLOGIN_EXPLICIT=no
+if [[ -v AUTOLOGIN ]]; then
+	AUTOLOGIN_EXPLICIT=yes
+else
+	AUTOLOGIN=yes
+fi
+# The "works like a normal desktop" layer: audio, bluetooth, mounting, codecs,
+# archives and firmware updates. Debian does not pull these in with
 # a bare DE metapackage the way Ubuntu's desktop task does.
 DESKTOP_EXTRAS="${DESKTOP_EXTRAS:-yes}"
 INSTALL_MEDIA_ACCEL="${INSTALL_MEDIA_ACCEL:-yes}"   # VA-API / VDPAU / Vulkan
@@ -311,12 +316,18 @@ fi
 [[ -r "$ZBM_PUBKEY_SOURCE" ]] \
 	|| die "Missing vendored ZFSBootMenu signing key: ${ZBM_PUBKEY_SOURCE}"
 
-case "$DESKTOP"       in kde|gnome|none)   ;; *) die "DESKTOP must be kde, gnome or none." ;; esac
-case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minimal or full." ;; esac
+case "$DESKTOP"       in minimal|full|none) ;; *) die "DESKTOP must be minimal, full or none." ;; esac
+case "$AUTOLOGIN"     in yes|no)            ;; *) die "AUTOLOGIN must be yes or no." ;; esac
 case "$BASELINE_MODE" in clone|send|none)  ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE"     in random|luks|none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
 case "$ENCRYPTION"    in yes|no)           ;; *) die "ENCRYPTION must be yes or no." ;; esac
 case "$ENABLE_BACKPORTS" in yes|no)          ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
+if [[ "$ENCRYPTION" == "no" || "$DESKTOP" == "none" ]]; then
+	if [[ "$AUTOLOGIN_EXPLICIT" == "yes" && "$AUTOLOGIN" == "yes" ]]; then
+		warn "AUTOLOGIN=yes ignored: autologin requires an encrypted desktop install."
+	fi
+	AUTOLOGIN=no
+fi
 [[ "$ENCRYPTION" == "no" || -z "$ZFS_PASSPHRASE" || ${#ZFS_PASSPHRASE} -ge 8 ]] \
 	|| die "ZFS_PASSPHRASE must be at least 8 characters."
 [[ "$SWAP_SIZE_MIB" =~ ^[0-9]+$ ]] || die "SWAP_SIZE_MIB must be a non-negative integer."
@@ -450,7 +461,7 @@ cat <<EOF
 
   Hostname         : ${TARGET_HOSTNAME}
   Admin user       : ${ADMIN_USER}
-  Desktop          : ${DESKTOP} (${DESKTOP_SIZE})  extras=${DESKTOP_EXTRAS}
+  Desktop          : ${DESKTOP}  extras=${DESKTOP_EXTRAS}  autologin=${AUTOLOGIN}
   Locale / TZ      : ${LOCALE} / ${TIMEZONE}
   Keyboard         : layout=${KEYMAP} variant=$( [[ -n "$KEYBOARD_VARIANT" ]] && echo "$KEYBOARD_VARIANT" || echo "(none, standard layout)" )
   Components       : ${COMPONENTS}
@@ -779,7 +790,7 @@ install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 INSTALL_ENV_WRITTEN=yes
 declare -p POOL_NAME BE_NAME ENCRYPTION KEYFILE TARGET_HOSTNAME ADMIN_USER ADMIN_FULLNAME \
 	ADMIN_GROUPS ROOT_PASSWORD ADMIN_PASSWORD TIMEZONE LOCALE KEYMAP \
-	KEYBOARD_VARIANT SUITE INSTALL_FIRMWARE EXTRA_PACKAGES DESKTOP DESKTOP_SIZE \
+	KEYBOARD_VARIANT SUITE INSTALL_FIRMWARE EXTRA_PACKAGES DESKTOP AUTOLOGIN \
 	DESKTOP_EXTRAS INSTALL_MEDIA_ACCEL INSTALL_FLATPAK INSTALL_OFFICE \
 	INSTALL_UNATTENDED_UPGRADES BOOT_DEVICE SWAP_DEVICE SWAP_SIZE_MIB SWAP_MODE \
 	SWAP_RANDOM_SOURCE SWAP_CIPHER SWAP_KEYSIZE SWAP_MAPPER \
@@ -1165,25 +1176,13 @@ fi
 #==============================================================================
 
 case "$DESKTOP" in
-	kde)
-		log "Installing KDE Plasma (${DESKTOP_SIZE})"
-		if [[ "$DESKTOP_SIZE" == "full" ]]; then
-			apt install -y kde-standard sddm
-		else
-			apt install -y kde-plasma-desktop sddm
-		fi
-		systemctl enable sddm
-		systemctl set-default graphical.target
+	minimal)
+		log "Installing Cinnamon (minimal)"
+		apt install -y cinnamon-core lightdm slick-greeter
 		;;
-	gnome)
-		log "Installing GNOME (${DESKTOP_SIZE})"
-		if [[ "$DESKTOP_SIZE" == "full" ]]; then
-			apt install -y gnome gdm3
-		else
-			apt install -y gnome-core gdm3
-		fi
-		systemctl enable gdm3
-		systemctl set-default graphical.target
+	full)
+		log "Installing Cinnamon (full)"
+		apt install -y cinnamon-desktop-environment lightdm slick-greeter
 		;;
 	none)
 		log "Skipping desktop install"
@@ -1191,13 +1190,25 @@ case "$DESKTOP" in
 		;;
 esac
 
+if [[ "$DESKTOP" != "none" ]]; then
+	systemctl enable lightdm
+	systemctl set-default graphical.target
+
+	if [[ "$AUTOLOGIN" == "yes" ]]; then
+		log "Enabling LightDM autologin for ${ADMIN_USER}"
+		install -d -m 0755 /etc/lightdm/lightdm.conf.d
+		cat > /etc/lightdm/lightdm.conf.d/60-autologin.conf <<EOF
+[Seat:*]
+autologin-user=${ADMIN_USER}
+EOF
+	fi
+fi
+
 if [[ "$DESKTOP" != "none" && "$DESKTOP_EXTRAS" == "yes" ]]; then
 	log "Installing desktop integration packages"
 
-	# Everything below is something a stock Debian DE metapackage leaves out
-	# but that you notice immediately when it is missing: audio routing,
-	# bluetooth, printing, automounting removable media, codecs, emoji,
-	# archive handling, firmware updates, power profiles.
+	# Desktop integration not guaranteed by the Cinnamon metapackages: audio,
+	# Bluetooth, removable media, codecs, archives and hardware services.
 	apt_install_available "session integration" \
 		xdg-user-dirs xdg-utils xdg-desktop-portal \
 		gvfs gvfs-backends gvfs-fuse udisks2 upower
@@ -1232,34 +1243,18 @@ if [[ "$DESKTOP" != "none" && "$DESKTOP_EXTRAS" == "yes" ]]; then
 			mesa-vulkan-drivers intel-media-va-driver-non-free vainfo
 	fi
 
-	case "$DESKTOP" in
-		kde)
-			apt_install_available "KDE applications" \
-				xdg-desktop-portal-kde ark kate okular gwenview spectacle \
-				kcalc kio-extras plasma-firewall
-			;;
-		gnome)
-			apt_install_available "GNOME applications" \
-				xdg-desktop-portal-gnome gnome-tweaks dconf-editor \
-				file-roller gnome-system-monitor
-			;;
-	esac
+	apt_install_available "Cinnamon applications" \
+		xdg-desktop-portal-xapp xdg-desktop-portal-gtk \
+		file-roller nemo-fileroller gnome-system-monitor
 
 	if [[ "$INSTALL_FLATPAK" == "yes" ]]; then
 		apt_install_available "flatpak" flatpak
-		case "$DESKTOP" in
-			kde)   apt_install_available "flatpak backend" plasma-discover-backend-flatpak ;;
-			gnome) apt_install_available "flatpak backend" gnome-software-plugin-flatpak ;;
-		esac
 	fi
 
 	if [[ "$INSTALL_OFFICE" == "yes" ]]; then
 		apt_install_available "office" \
 			libreoffice-writer libreoffice-calc libreoffice-impress
-		case "$DESKTOP" in
-			kde)   apt_install_available "office integration" libreoffice-kf6 ;;
-			gnome) apt_install_available "office integration" libreoffice-gtk3 ;;
-		esac
+		apt_install_available "office integration" libreoffice-gtk3
 	fi
 fi
 

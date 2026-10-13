@@ -219,6 +219,8 @@ rEFInd offers four ways in, all using the same EFI image:
 
 Inside ZFSBootMenu: `Ctrl-H` for help, `Ctrl-S` to browse snapshots of the selected environment, `Ctrl-R` for a recovery shell.
 
+On encrypted desktop installs, LightDM logs in `ADMIN_USER` automatically by default because the ZFSBootMenu passphrase already gates boot. `ENCRYPTION=no` and `DESKTOP=none` force autologin off. Cinnamon locks the session on suspend by default; expect the desktop keyring to ask for its password once after the first automatic login.
+
 Change Debian's boot verbosity later without touching the bootloader:
 
 ```bash
