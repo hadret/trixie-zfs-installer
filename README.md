@@ -179,7 +179,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `SUITE` / `MIRROR` | `trixie` / deb.debian.org | |
 | `COMPONENTS` | `main contrib non-free non-free-firmware` | |
 | `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites |
-| `ENABLE_BACKPORTS` | `yes` | `yes` adds the repo with Debian's native policy and seeds ZFS from it; `no` uses base Trixie |
+| `BACKPORTS` | `zfs` | `none` keeps stable packages; `zfs` pins only `src:zfs-linux` to backports; `full` prefers backports system-wide while keeping the kernel on stable |
 | `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
@@ -204,7 +204,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `REFIND_TIMEOUT` | `30` | rEFInd menu timeout in seconds; `0` waits indefinitely |
 | `REFIND_DEFAULT` | — | rEFInd `default_selection` (a substring of the entry title, e.g. `ZBM-6.12`); empty highlights the first entry |
 | `ENCRYPTION_ALGO` | `aes-256-gcm` | |
-| `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.4-linux` with backports, `openzfs-2.3-linux` without; `off` disables the pin |
+| `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.3-linux` with `BACKPORTS=none`, `openzfs-2.4-linux` with `zfs` or `full`; `off` disables the pin |
 
 > Password variables are intended for controlled unattended installs. Supplying them inline with the command can expose them to process inspection.
 
@@ -330,16 +330,27 @@ If `BASELINE_MODE=clone`, the `@baseline` snapshot **cannot** be destroyed while
 
 ## Upgrading OpenZFS and the pool
 
-By default the script adds `trixie-backports` with Debian's native
-`NotAutomatic: yes` / `ButAutomaticUpgrades: yes` policy and explicitly installs
-ZFS from it once. Future ZFS updates from backports are then selected normally,
-without pulling unrelated backports packages. Set `ENABLE_BACKPORTS=no` to use
-base Trixie and omit the backports source.
+The `trixie-backports` source is always present with Debian's native
+`NotAutomatic: yes` / `ButAutomaticUpgrades: yes` policy. `BACKPORTS` controls
+only the pin written to `/etc/apt/preferences.d/backports.pref`:
+
+- `none`: no pin. Stable remains preferred, including OpenZFS 2.3.
+- `zfs` (default): only the `zfs-linux` source package is pinned to priority
+  600. OpenZFS 2.4 comes from backports while dependencies such as curl remain
+  on stable.
+- `full`: all backports packages are pinned to priority 500, so their newer
+  versions win. The `linux` and `linux-signed-amd64` source packages are pinned
+  back to priority 100 so the kernel stays on stable. This mode is deliberately
+  noisy because it opts the whole userspace into backports.
+
+The source-scoped ZFS pin avoids `apt install -t trixie-backports`, which would
+also select every new dependency from backports and can create a mixed stack.
 
 ### Order matters
 
 By default the pool compatibility follows the selected ZFS package track:
-`openzfs-2.4-linux` with backports, or `openzfs-2.3-linux` with base Trixie.
+`openzfs-2.3-linux` with `BACKPORTS=none`, or `openzfs-2.4-linux` with
+`BACKPORTS=zfs|full`.
 ZFSBootMenu v3.1.0 embeds OpenZFS 2.4 and can import either. This prevents a
 routine OS-side `zpool upgrade` from enabling flags that the boot environment
 cannot read. `POOL_COMPAT=off` removes this safety rail entirely.

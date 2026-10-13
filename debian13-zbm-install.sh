@@ -148,7 +148,7 @@ COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
 
 ENABLE_UPDATES="${ENABLE_UPDATES:-yes}"     # ${SUITE}-updates
 ENABLE_SECURITY="${ENABLE_SECURITY:-yes}"   # ${SUITE}-security
-ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-yes}" # Debian's native backports policy
+BACKPORTS="${BACKPORTS:-zfs}"               # none | zfs | full
 # proposed-updates has normal priority and may be selected on upgrade.
 ENABLE_PROPOSED_UPDATES="${ENABLE_PROPOSED_UPDATES:-no}"
 
@@ -295,14 +295,19 @@ list_disks() {
 [[ $EUID -eq 0 ]] || die "Run this script as root (sudo -i)."
 [[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
 
+case "$BACKPORTS" in none | zfs | full) ;; *) die "BACKPORTS must be none, zfs or full." ;; esac
+if [[ "$BACKPORTS" == "full" ]]; then
+  warn "BACKPORTS=full selects newer backports packages system-wide; the kernel stays on stable for ZFS compatibility."
+fi
+
 # Keep pool features compatible with ZFSBootMenu; never guess for unknown releases.
 if [[ -z "$POOL_COMPAT" ]]; then
   case "$ZBM_VERSION" in
   v3.1.0)
-    if [[ "$ENABLE_BACKPORTS" == "yes" ]]; then
-      POOL_COMPAT="openzfs-2.4-linux"
-    else
+    if [[ "$BACKPORTS" == "none" ]]; then
       POOL_COMPAT="openzfs-2.3-linux"
+    else
+      POOL_COMPAT="openzfs-2.4-linux"
     fi
     ;;
   *) die "POOL_COMPAT must be set explicitly for ZFSBootMenu ${ZBM_VERSION}." ;;
@@ -343,7 +348,6 @@ case "$AUTOLOGIN" in yes | no) ;; *) die "AUTOLOGIN must be yes or no." ;; esac
 case "$BASELINE_MODE" in clone | send | none) ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE" in random | luks | none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
 case "$ENCRYPTION" in yes | no) ;; *) die "ENCRYPTION must be yes or no." ;; esac
-case "$ENABLE_BACKPORTS" in yes | no) ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
 if [[ "$ENCRYPTION" == "no" || "$DESKTOP" == "none" ]]; then
   if [[ "$AUTOLOGIN_EXPLICIT" == "yes" && "$AUTOLOGIN" == "yes" ]]; then
     warn "AUTOLOGIN=yes ignored: autologin requires an encrypted desktop install."
@@ -376,8 +380,33 @@ if [[ "$POOL_COMPAT" != "off" && ! "$POOL_COMPAT" =~ ^[A-Za-z0-9._-]+$ ]]; then
   die "POOL_COMPAT contains invalid characters: ${POOL_COMPAT}"
 fi
 
-BPO=()
-[[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
+# Backports remains at Debian's native priority unless a mode opts into pins.
+gen_backports_pin() {
+  case "$BACKPORTS" in
+  none) return 0 ;;
+  zfs)
+    printf 'Package: src:zfs-linux\nPin: release n=%s-backports\nPin-Priority: 600\n' "$SUITE"
+    ;;
+  full)
+    cat <<EOF
+Package: *
+Pin: release n=${SUITE}-backports
+Pin-Priority: 500
+
+Package: src:linux src:linux-signed-amd64
+Pin: release n=${SUITE}-backports
+Pin-Priority: 100
+EOF
+    ;;
+  esac
+}
+
+write_backports_pin() {
+  local root="${1:-}" path="${1:-}/etc/apt/preferences.d/backports.pref"
+  rm -f "${root}/etc/apt/preferences.d/backports.pref" \
+    "${root}/etc/apt/preferences.d/zfs-backports.pref"
+  [[ "$BACKPORTS" == "none" ]] || gen_backports_pin | install -D -m 0644 /dev/stdin "$path"
+}
 
 if [[ ! "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
   die "ADMIN_USER '${ADMIN_USER}' is not a valid Unix username."
@@ -498,7 +527,8 @@ cat <<EOF
   Locale / TZ      : ${LOCALE} / ${TIMEZONE}
   Keyboard         : layout=${KEYMAP} variant=$([[ -n "$KEYBOARD_VARIANT" ]] && echo "$KEYBOARD_VARIANT" || echo "(none, standard layout)")
   Components       : ${COMPONENTS}
-  Suites           : ${SUITE}$([[ "$ENABLE_UPDATES" == yes ]] && echo " +updates")$([[ "$ENABLE_SECURITY" == yes ]] && echo " +security")$([[ "$ENABLE_BACKPORTS" == yes ]] && echo " +backports")$([[ "$ENABLE_PROPOSED_UPDATES" == yes ]] && echo " +proposed-updates")
+  Suites           : ${SUITE}$([[ "$ENABLE_UPDATES" == yes ]] && echo " +updates")$([[ "$ENABLE_SECURITY" == yes ]] && echo " +security") +backports$([[ "$ENABLE_PROPOSED_UPDATES" == yes ]] && echo " +proposed-updates")
+  Backports mode   : ${BACKPORTS}$([[ "$BACKPORTS" == full ]] && echo "  WARNING: system-wide; stable kernel pinned")
 EOF
 
 if [[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]]; then
@@ -553,8 +583,7 @@ APT_SUITES=("${SUITE}|${MIRROR}|")
   APT_SUITES+=("${SUITE}-security|${SECURITY_MIRROR}|Security updates")
 [[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]] &&
   APT_SUITES+=("${SUITE}-proposed-updates|${MIRROR}|Queued for the next point release; normal priority")
-[[ "$ENABLE_BACKPORTS" == "yes" ]] &&
-  APT_SUITES+=("${SUITE}-backports|${MIRROR}|Debian's native backports policy")
+APT_SUITES+=("${SUITE}-backports|${MIRROR}|Debian's native backports policy")
 
 # Emit sources.list; $1 is live (binary only) or target (with deb-src).
 gen_sources() {
@@ -578,18 +607,19 @@ gen_sources() {
 
 log "Configuring APT in the live environment"
 gen_sources live >/etc/apt/sources.list
+write_backports_pin
 rm -f /etc/apt/sources.list.d/debian.sources
 export DEBIAN_FRONTEND=noninteractive
 apt update
 
 log "Installing ZFS and helpers in the live environment (DKMS build, be patient)"
 apt install -y debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates
-apt install -y "${BPO[@]}" zfsutils-linux zfs-dkms
+apt install -y zfsutils-linux zfs-dkms
 modprobe zfs || die "zfs module failed to load in the live environment."
 
 if [[ "$POOL_COMPAT" != "off" &&
   ! -r "/usr/share/zfs/compatibility.d/${POOL_COMPAT}" ]]; then
-  die "ZFS compatibility profile '${POOL_COMPAT}' is unavailable. Choose a profile from /usr/share/zfs/compatibility.d, or set POOL_COMPAT=off. With ENABLE_BACKPORTS=no on Trixie, use openzfs-2.3-linux."
+  die "ZFS compatibility profile '${POOL_COMPAT}' is unavailable. Choose a profile from /usr/share/zfs/compatibility.d, or set POOL_COMPAT=off. With BACKPORTS=none on Trixie, use openzfs-2.3-linux."
 fi
 
 # [GUIDE] Generate /etc/hostid
@@ -827,6 +857,7 @@ mount -t efivarfs efivarfs /mnt/sys/firmware/efi/efivars 2>/dev/null ||
 log "Writing chroot payload"
 
 gen_sources target >/mnt/root/sources.list.new
+write_backports_pin /mnt
 install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 
 INSTALL_ENV_WRITTEN=yes
@@ -838,7 +869,7 @@ declare -p POOL_NAME BE_NAME ENCRYPTION KEYFILE TARGET_HOSTNAME ADMIN_USER ADMIN
   SWAP_RANDOM_SOURCE SWAP_CIPHER SWAP_KEYSIZE SWAP_MAPPER \
   INSTALL_CRYPTSETUP_INITRAMFS ZBM_VERSION ZBM_BASE_URL ZBM_RECOVERY ZBM_BACKUP \
   ZBM_FALLBACK_KERNEL ZBM_CMDLINE ZBM_TIMEOUT KERNEL_CMDLINE REFIND_DEFAULT \
-  REFIND_TIMEOUT SELECTED_KERNELS BPO >/mnt/run/zbm-install.env
+  REFIND_TIMEOUT SELECTED_KERNELS >/mnt/run/zbm-install.env
 chmod 600 /mnt/run/zbm-install.env
 
 cat >/mnt/root/zbm-chroot.sh <<'CHROOT_EOF'
@@ -931,7 +962,7 @@ dpkg-reconfigure -f noninteractive keyboard-configuration console-setup
 log "Installing kernel and ZFS"
 mkdir -p /etc/dkms
 apt install -y linux-headers-amd64 linux-image-amd64 dosfstools dkms
-apt install -y "${BPO[@]}" zfsutils-linux zfs-dkms zfs-zed zfs-initramfs
+apt install -y zfsutils-linux zfs-dkms zfs-zed zfs-initramfs
 echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
 
 #--- Microcode and firmware ---------------------------------------------------
