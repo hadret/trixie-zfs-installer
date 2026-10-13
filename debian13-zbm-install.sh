@@ -757,7 +757,6 @@ zpool_opts=(
 	-O xattr=sa
 	-O relatime=off
 	-O atime=off
-	-O logbias=throughput
 	-O "encryption=${ENCRYPTION_ALGO}"
 	-O "keylocation=file://${KEYFILE}"
 	-O keyformat=passphrase
