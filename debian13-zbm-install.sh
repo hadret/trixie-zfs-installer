@@ -1785,12 +1785,16 @@ NEW USERS
 
 POOL COMPATIBILITY
   Current profile: ${POOL_COMPAT}
-  ZFSBootMenu ${ZBM_VERSION} images embed OpenZFS 2.4.0.
+  Every ZFSBootMenu image you keep must support every feature allowed by this
+  profile. Check the selected release's notes rather than assuming its bundled
+  OpenZFS version.
 
   To move the pool to a future OpenZFS profile:
-    1. Replace every release, recovery, backup and BOOTX64 ZBM image first.
-    2. Boot through a new image and prove it imports this pool.
-    3. Confirm the OS provides the target profile, then run:
+    1. Install one verified new release image; keep known-good fallbacks intact.
+    2. Boot through the new image and prove it imports this pool.
+    3. Replace every remaining release, recovery, backup and BOOTX64 image with
+       a verified image that supports the target profile.
+    4. Confirm the OS provides the target profile, then run:
 
        target=openzfs-2.5-linux
        test -r "/usr/share/zfs/compatibility.d/\${target}"

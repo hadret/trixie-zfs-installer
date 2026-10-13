@@ -320,11 +320,13 @@ cannot read. `POOL_COMPAT=off` removes this safety rail entirely.
 
 When moving to a future OpenZFS release, follow this order:
 
-1. **Refresh ZFSBootMenu first.** Replace every release, recovery, backup and
-   `EFI/BOOT/BOOTX64.EFI` image you may rely on with a verified ZBM release that
-   embeds the target OpenZFS version.
-2. **Boot through a new image** and prove that it imports the pool and boots the OS.
-3. **Confirm the OS has the matching profile**, then deliberately move the pin
+1. **Install one verified new release image** while keeping the known-good
+   recovery, backup and `EFI/BOOT/BOOTX64.EFI` images intact.
+2. **Boot through the new image** and prove that it imports the pool and boots the OS.
+3. **Refresh every remaining image** — release, recovery, backup and
+   `EFI/BOOT/BOOTX64.EFI` — with a verified ZBM release that supports the target
+   OpenZFS profile.
+4. **Confirm the OS has the matching profile**, then deliberately move the pin
    and enable its feature flags:
    ```bash
    target=openzfs-2.5-linux
