@@ -286,6 +286,62 @@ log()  { printf '\n\033[1;32m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[X]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Failure cleanup is ownership-driven: these markers are set only after this
+# run creates each resource, so the trap cannot touch an unrelated /mnt or pool.
+INSTALL_POOL_CREATED=no
+INSTALL_POOL_GUID=""
+INSTALL_ENV_WRITTEN=no
+LIVE_KEY_WRITTEN=no
+
+secure_remove_file() {
+	local path="$1"
+	[[ -e "$path" ]] || return 0
+	if command -v shred >/dev/null 2>&1 \
+		&& shred -u -z -- "$path" 2>/dev/null; then
+		return 0
+	fi
+	rm -f -- "$path"
+}
+
+cleanup_on_failure() {
+	local rc="$1" imported_guid="" secret
+	(( rc != 0 )) || return 0
+
+	# Prevent recursion if any best-effort cleanup command itself fails.
+	trap - EXIT INT TERM
+	set +e
+	warn "Installation failed (exit ${rc}); cleaning up this run's resources."
+
+	if [[ "$INSTALL_ENV_WRITTEN" == "yes" ]]; then
+		for secret in /mnt/run/*-install.env; do
+			if [[ -e "$secret" ]] && ! rm -f -- "$secret"; then
+				warn "Could not remove ${secret}; remove it manually before rebooting."
+			fi
+		done
+		rm -f -- /mnt/root/zbm-chroot.sh /mnt/root/sources.list.new
+	fi
+
+	if [[ "$LIVE_KEY_WRITTEN" == "yes" && -n "${KEYFILE:-}" ]]; then
+		secure_remove_file "$KEYFILE" \
+			|| warn "Could not remove live key ${KEYFILE}; remove it manually before rebooting."
+	fi
+
+	if [[ "$INSTALL_POOL_CREATED" == "yes" ]]; then
+		umount -n -R /mnt 2>/dev/null || umount -n -R -l /mnt 2>/dev/null || true
+		imported_guid="$(zpool get -H -o value guid "$POOL_NAME" 2>/dev/null || true)"
+		if [[ -n "$imported_guid" \
+			&& ( -z "$INSTALL_POOL_GUID" || "$imported_guid" == "$INSTALL_POOL_GUID" ) ]]; then
+			zpool export "$POOL_NAME" 2>/dev/null \
+				|| warn "Could not export ${POOL_NAME}; export it manually before rebooting."
+		elif [[ -n "$imported_guid" ]]; then
+			warn "Refusing to export ${POOL_NAME}: imported GUID ${imported_guid} does not match ${INSTALL_POOL_GUID}."
+		fi
+	fi
+
+	warn "Cleanup complete; original exit status was ${rc}."
+	exit "$rc"
+}
+
 prompt_pass() {
 	local __var="$1" label="$2" minlen="${3:-1}" p1 p2
 	while :; do
@@ -609,6 +665,12 @@ if zpool list -H -o name 2>/dev/null | grep -qx "$POOL_NAME"; then
 	die "Refusing to continue with an ambiguous pool name."
 fi
 
+# Arm failure cleanup only once this run is about to create resources or alter
+# the target. Preflight failures and a declined ERASE confirmation need none.
+trap 'cleanup_on_failure "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 log "Wiping ${DISK}"
 swapoff -a || true
 zpool labelclear -f "$DISK" 2>/dev/null || true
@@ -682,6 +744,7 @@ fi
 # "created in a previous step", but never shows that step.
 log "Writing pool key to ${KEYFILE}"
 mkdir -p /etc/zfs
+LIVE_KEY_WRITTEN=yes
 printf '%s' "$ZFS_PASSPHRASE" > "$KEYFILE"
 chmod 000 "$KEYFILE"
 
@@ -704,12 +767,14 @@ if [[ "$POOL_COMPAT" != "off" ]]; then
 	zpool_opts+=(-o "compatibility=${POOL_COMPAT}")
 fi
 zpool create "${zpool_opts[@]}" -m none "$POOL_NAME" "$POOL_DEVICE"
+INSTALL_POOL_CREATED=yes
 
 # A pool's GUID is unique and unambiguous where its name is not. Everything
 # below re-imports by GUID so the script can never grab a same-named pool that
 # happens to live on another disk.
 POOL_GUID="$(zpool get -H -o value guid "$POOL_NAME")"
 [[ -n "$POOL_GUID" ]] || die "Could not read the GUID of the new pool."
+INSTALL_POOL_GUID="$POOL_GUID"
 echo "  pool GUID: ${POOL_GUID}"
 
 #------------------------------------------------------------------------------
@@ -836,6 +901,7 @@ log "Writing chroot payload"
 gen_sources target > /mnt/root/sources.list.new
 install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 
+INSTALL_ENV_WRITTEN=yes
 {
 	printf 'POOL_NAME=%q\n'              "$POOL_NAME"
 	printf 'BE_NAME=%q\n'                "$BE_NAME"
@@ -881,13 +947,13 @@ install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 	printf 'KERNEL_CMDLINE=%q\n'         "$KERNEL_CMDLINE"
 	printf 'REFIND_DEFAULT=%q\n'         "$REFIND_DEFAULT"
 	printf 'REFIND_TIMEOUT=%q\n'         "$REFIND_TIMEOUT"
-} > /mnt/root/zbm-install.env
-chmod 600 /mnt/root/zbm-install.env
+} > /mnt/run/zbm-install.env
+chmod 600 /mnt/run/zbm-install.env
 
 cat > /mnt/root/zbm-chroot.sh <<'CHROOT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-source /root/zbm-install.env
+source /run/zbm-install.env
 
 BPO=()
 [[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
@@ -1553,7 +1619,9 @@ chroot /mnt /usr/bin/env bash /root/zbm-chroot.sh
 #==============================================================================
 
 log "Removing installer artefacts"
-rm -f /mnt/root/zbm-install.env /mnt/root/zbm-chroot.sh /mnt/root/sources.list.new
+rm -f -- /mnt/run/zbm-install.env
+INSTALL_ENV_WRITTEN=no
+rm -f /mnt/root/zbm-chroot.sh /mnt/root/sources.list.new
 
 if [[ "$BASELINE_MODE" != "none" ]]; then
 	log "Creating factory baseline boot environment (${BASELINE_MODE})"
@@ -1591,6 +1659,9 @@ umount -n -R /mnt || {
 }
 sleep 2
 zpool export "$POOL_NAME"
+INSTALL_POOL_CREATED=no
+secure_remove_file "$KEYFILE"
+LIVE_KEY_WRITTEN=no
 
 log "Done"
 cat <<EOF
