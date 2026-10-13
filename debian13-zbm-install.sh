@@ -67,8 +67,8 @@
 # Disk layout on $DISK (a /dev/disk/by-id/... path; GPT, fully wiped)
 #------------------------------------------------------------------------------
 #   -part1   2048 MiB (default)   ef00   ESP -> /boot/efi
-#   -part2   1024 MiB          8309/8200 encrypted swap (LUKS2 by default)
-#   -part3   rest - 10 MiB        bf00   zroot
+#   -part2   1024 MiB          8200/8309 encrypted swap (random-key by default)
+#   -part3   rest - 10 MiB        bf00   zroot (part2 when swap is disabled)
 #
 #------------------------------------------------------------------------------
 # Usage
@@ -189,11 +189,11 @@ SWAP_SIZE_MIB="${SWAP_SIZE_MIB:-1024}"
 #          on the encrypted root. Root is already open when crypttab is
 #          processed, so it never prompts. Partition type 8309 (Linux LUKS),
 #          which is what systemd expects to see on a real LUKS volume.
-#          THIS IS THE DEFAULT and the more robust of the two.
 # random : plain dm-crypt, fresh key from $SWAP_RANDOM_SOURCE every boot.
 #          Nothing survives a reboot. Partition type 8200 (Linux swap) --
 #          typing it 8309 makes systemd-gpt-auto-generator try to unlock it as
 #          LUKS, which fails and drags the real swap unit down with it.
+#          THIS IS THE DEFAULT.
 # none   : no swap partition at all
 #
 # Either way hibernation is not configured; RESUME=none is set below.
@@ -428,6 +428,12 @@ case "$DESKTOP_SIZE"  in minimal|full)     ;; *) die "DESKTOP_SIZE must be minim
 case "$BASELINE_MODE" in clone|send|none)  ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE"     in random|luks|none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
 case "$ENABLE_BACKPORTS" in yes|no)          ;; *) die "ENABLE_BACKPORTS must be yes or no." ;; esac
+[[ "$SWAP_SIZE_MIB" =~ ^[0-9]+$ ]] || die "SWAP_SIZE_MIB must be a non-negative integer."
+SWAP_SIZE_MIB=$(( 10#$SWAP_SIZE_MIB ))
+if [[ "$SWAP_MODE" == "none" ]] || (( SWAP_SIZE_MIB == 0 )); then
+	SWAP_MODE="none"
+	SWAP_SIZE_MIB=0
+fi
 if [[ "$POOL_COMPAT" != "off" && ! "$POOL_COMPAT" =~ ^[A-Za-z0-9._-]+$ ]]; then
 	die "POOL_COMPAT contains invalid characters: ${POOL_COMPAT}"
 fi
@@ -515,8 +521,7 @@ fi
 BOOT_PART=1
 SWAP_PART=2
 POOL_PART=3
-if (( SWAP_SIZE_MIB <= 0 )); then
-	SWAP_MODE="none"
+if [[ "$SWAP_MODE" == "none" ]]; then
 	POOL_PART=2
 fi
 BOOT_DEVICE="${DISK}-part${BOOT_PART}"
@@ -685,7 +690,7 @@ udevadm settle
 
 log "Creating partitions"
 sgdisk -n "${BOOT_PART}:1m:+${ESP_SIZE_MIB}m" -t "${BOOT_PART}:ef00" -c "${BOOT_PART}:EFI" "$DISK"
-if (( SWAP_SIZE_MIB > 0 )); then
+if [[ "$SWAP_MODE" != "none" ]]; then
 	# 8200 = Linux swap, 8309 = Linux LUKS. Getting this wrong makes
 	# systemd-gpt-auto-generator create a competing unit that cannot succeed.
 	swap_type=8200
@@ -702,7 +707,7 @@ sgdisk -p "$DISK"
 for p in "$BOOT_DEVICE" "$POOL_DEVICE"; do
 	[[ -b "$p" ]] || die "Expected partition link $p does not exist after partitioning."
 done
-if (( SWAP_SIZE_MIB > 0 )) && [[ ! -b "$SWAP_DEVICE" ]]; then
+if [[ "$SWAP_MODE" != "none" && ! -b "$SWAP_DEVICE" ]]; then
 	die "Expected partition link $SWAP_DEVICE does not exist."
 fi
 

@@ -109,8 +109,10 @@ An empty `KEYBOARD_VARIANT` is normal and correct for most people — it means t
 | Part | Size | Type | Purpose |
 |---|---|---|---|
 | 1 | 1024 MiB | `ef00` | ESP → `/boot/efi`, holds rEFInd + ZFSBootMenu |
-| 2 | 1024 MiB | `8309` | encrypted swap |
+| 2 | 1024 MiB | `8200` / `8309` | random-key dm-crypt (default) / LUKS2 swap |
 | 3 | rest − 10 MiB | `bf00` | `zroot` |
+
+With `SWAP_MODE=none` or `SWAP_SIZE_MIB=0`, the swap partition is omitted and `zroot` becomes partition 2.
 
 The kernel and initramfs live on the ZFS root dataset, so they are snapshotted and rolled back along with everything else. That is the whole point of the design.
 
@@ -166,7 +168,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `KEYBOARD_VARIANT` | inherited from live ISO | Empty = standard layout. Pass `KEYBOARD_VARIANT=` to force none |
 | `DESKTOP` | `minimal` | Cinnamon `minimal` or `full`, or `none` for headless |
 | `AUTOLOGIN` | `yes` if encrypted | LightDM autologin for `ADMIN_USER`. **Forced to `no` on unencrypted pools**; with encryption, the ZBM passphrase already gates the machine |
-| `SWAP_SIZE_MIB` | `1024` | `0` disables swap entirely |
+| `SWAP_SIZE_MIB` | `1024` | `0` disables swap entirely and normalizes `SWAP_MODE` to `none` |
 | `SWAP_RANDOM_SOURCE` | `/dev/urandom` | See [note on swap](#a-note-on-random-key-swap) |
 | `POOL_NAME` | `zroot` | |
 | `BE_NAME` | `default` | Active boot environment |
@@ -184,7 +186,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `FORCE` | `no` | `yes` skips **only** the `ERASE` confirmation |
 | `LIST_KEYBOARD` | — | List variants and exit |
 | `ESP_SIZE_MIB` | `1024` | |
-| `SWAP_MODE` | `random` | `random`, `luks`, `none` |
+| `SWAP_MODE` | `random` | `random`, `luks`, `none`; `none` omits the partition and normalizes its size to `0` |
 | `ZBM_CMDLINE` | `loglevel=6` | ZFSBootMenu's **own** kernel command line |
 | `KERNEL_CMDLINE` | `loglevel=6 systemd.show_status=yes` | What ZBM passes to Debian |
 | `ZBM_TIMEOUT` | `10` | Countdown before booting `bootfs` |
