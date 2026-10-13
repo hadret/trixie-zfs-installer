@@ -90,7 +90,7 @@ DESKTOP=minimal \
 ./debian13-zbm-install.sh
 ```
 
-The script prints a full configuration summary, then requires you to type `ERASE` before touching the disk. Passwords are prompted interactively (root, admin user, and the ZFS passphrase when encryption is enabled) unless supplied as variables.
+The script prints a full configuration summary, then requires you to type `ERASE` before touching the disk. It prompts once for the admin password and, by default, also uses it as the encrypted-pool passphrase. Set `ZFS_PASSPHRASE` to keep those credentials separate. The root account is locked unless `ROOT_PASSWORD` is supplied.
 
 ### Not sure about the keyboard layout?
 
@@ -185,8 +185,9 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
-| `ROOT_PASSWORD` / `ADMIN_PASSWORD` | prompted | Passing these on the command line leaks them to `ps` |
-| `ZFS_PASSPHRASE` | prompted when encrypted | Ignored when `ENCRYPTION=no`; passing it on the command line leaks it to `ps` |
+| `ADMIN_PASSWORD` | prompted | Minimum 8 characters; also used for the encrypted pool unless overridden. Passing it on the command line leaks it to `ps` |
+| `ZFS_PASSPHRASE` | `ADMIN_PASSWORD` when encrypted | Minimum 8 characters; set it separately when the admin password is not easy to type with ZFSBootMenu's US keymap. Ignored when `ENCRYPTION=no` |
+| `ROOT_PASSWORD` | — | Empty leaves the root account locked; a supplied value must be at least 8 characters |
 | `FORCE` | `no` | `yes` skips **only** the `ERASE` confirmation |
 | `LIST_KEYBOARD` | — | List variants and exit |
 | `ESP_SIZE_MIB` | `2048` | |
@@ -197,6 +198,8 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ZBM_FALLBACK` | `yes` | Also install to `EFI/BOOT/BOOTX64.EFI` |
 | `ENCRYPTION_ALGO` | `aes-256-gcm` | |
 | `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.4-linux` with backports, `openzfs-2.3-linux` without; `off` disables the pin |
+
+> Password variables are intended for controlled unattended installs. Supplying them inline with the command can expose them to process inspection.
 
 > **`ZBM_CMDLINE` and `KERNEL_CMDLINE` are not the same thing.** The first configures ZFSBootMenu's own kernel (what you see while it imports the pool and asks for the passphrase). The second is stored in `org.zfsbootmenu:commandline` and configures Debian. Conflating them is the most common mistake with this setup.
 
@@ -312,7 +315,6 @@ The script leaves an `@install` or `@baseline` snapshot. Once you're happy:
 ```bash
 sudo zfs list -t snapshot
 sudo zfs destroy POOL/ROOT/default@install
-sudo usermod -p '*' root          # disable the root password (optional)
 ```
 
 If `BASELINE_MODE=clone`, the `@baseline` snapshot **cannot** be destroyed while the clone exists. That is deliberate — it's the guarantee a factory image should have.
@@ -358,6 +360,10 @@ any older ZBM image that lacks those features is no longer a usable fallback.
 ---
 
 ## Recovery
+
+The root account is locked by default. Use the admin account with `sudo` during normal operation; if that account is unavailable, use ZFSBootMenu's `Ctrl-R` recovery shell or a live ISO.
+
+The login and pool credentials are only initialized from the same value. Changing the login password with `passwd` does **not** change the pool passphrase; that requires `zfs change-key`, updating the installed key file, and rebuilding the initramfs.
 
 From any Debian live ISO:
 

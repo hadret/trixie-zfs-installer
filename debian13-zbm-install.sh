@@ -172,7 +172,9 @@ INSTALL_FLATPAK="${INSTALL_FLATPAK:-no}"
 INSTALL_OFFICE="${INSTALL_OFFICE:-no}"
 INSTALL_UNATTENDED_UPGRADES="${INSTALL_UNATTENDED_UPGRADES:-no}"
 
-#--- Passwords (prompted if unset) --------------------------------------------
+#--- Passwords ---------------------------------------------------------------
+# The admin password also unlocks the encrypted pool unless overridden.
+# An empty ROOT_PASSWORD leaves root locked.
 ROOT_PASSWORD="${ROOT_PASSWORD:-}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 ZFS_PASSPHRASE="${ZFS_PASSPHRASE:-}"
@@ -269,6 +271,11 @@ prompt_pass() {
   return 0
 }
 
+is_printable_ascii() {
+  local LC_ALL=C
+  [[ "$1" =~ ^[[:print:]]+$ ]]
+}
+
 list_disks() {
   local l
   echo "Whole disks under /dev/disk/by-id/:" >&2
@@ -345,6 +352,17 @@ if [[ "$ENCRYPTION" == "no" || "$DESKTOP" == "none" ]]; then
 fi
 [[ "$ENCRYPTION" == "no" || -z "$ZFS_PASSPHRASE" || ${#ZFS_PASSPHRASE} -ge 8 ]] ||
   die "ZFS_PASSPHRASE must be at least 8 characters."
+[[ "$ENCRYPTION" == "no" || -z "$ZFS_PASSPHRASE" ]] ||
+  is_printable_ascii "$ZFS_PASSPHRASE" ||
+  die "ZFS_PASSPHRASE must use printable ASCII so it can be typed in ZFSBootMenu."
+[[ -z "$ADMIN_PASSWORD" || ${#ADMIN_PASSWORD} -ge 8 ]] ||
+  die "ADMIN_PASSWORD must be at least 8 characters."
+if [[ "$ENCRYPTION" == "yes" && -z "$ZFS_PASSPHRASE" && -n "$ADMIN_PASSWORD" ]]; then
+  is_printable_ascii "$ADMIN_PASSWORD" ||
+    die "ADMIN_PASSWORD must be printable ASCII when shared with ZFS; set ZFS_PASSPHRASE separately."
+fi
+[[ -z "$ROOT_PASSWORD" || ${#ROOT_PASSWORD} -ge 8 ]] ||
+  die "ROOT_PASSWORD must be at least 8 characters."
 [[ "$SWAP_SIZE_MIB" =~ ^[0-9]+$ ]] || die "SWAP_SIZE_MIB must be a non-negative integer."
 SWAP_SIZE_MIB=$((10#$SWAP_SIZE_MIB))
 if [[ "$SWAP_MODE" == "none" ]] || ((SWAP_SIZE_MIB == 0)); then
@@ -497,14 +515,31 @@ if [[ "$FORCE" != "yes" ]]; then
   [[ "$confirm" == "ERASE" ]] || die "Aborted."
 fi
 
-log "Collecting passwords"
-[[ -n "$ROOT_PASSWORD" ]] || prompt_pass ROOT_PASSWORD "root password" 1
-[[ -n "$ADMIN_PASSWORD" ]] || prompt_pass ADMIN_PASSWORD "password for ${ADMIN_USER}" 1
+log "Collecting password"
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  if [[ "$ENCRYPTION" == "yes" && -z "$ZFS_PASSPHRASE" ]]; then
+    echo "  This password will also unlock the encrypted ZFS pool."
+    echo "  It is typed inside ZFSBootMenu at every boot, on a basic US keymap."
+  fi
+  prompt_pass ADMIN_PASSWORD "password for ${ADMIN_USER}" 8
+fi
 if [[ "$ENCRYPTION" == "yes" && -z "$ZFS_PASSPHRASE" ]]; then
   # [GUIDE] The pool passphrase must be typeable in ZFSBootMenu's minimal keymap.
-  echo "  Typed inside ZFSBootMenu at every boot, on a basic keymap."
-  echo "  Prefer unshifted ASCII you can find blind."
-  prompt_pass ZFS_PASSPHRASE "ZFS pool passphrase" 8
+  if is_printable_ascii "$ADMIN_PASSWORD"; then
+    ZFS_PASSPHRASE="$ADMIN_PASSWORD"
+    case "$KEYMAP" in
+    us | pl) ;;
+    *) warn "The shared pool password must be typed with ZFSBootMenu's US keymap; KEYMAP=${KEYMAP} may place some characters differently." ;;
+    esac
+  else
+    warn "The login password cannot be typed in ZFSBootMenu; choose a separate printable-ASCII pool passphrase."
+    while :; do
+      echo "  Typed inside ZFSBootMenu at every boot, on a basic US keymap."
+      prompt_pass ZFS_PASSPHRASE "ZFS pool passphrase" 8
+      is_printable_ascii "$ZFS_PASSPHRASE" && break
+      warn "The ZFS pool passphrase must use printable ASCII. Try again."
+    done
+  fi
 fi
 
 #==============================================================================
@@ -1152,7 +1187,9 @@ fi
 
 log "Creating accounts"
 apt install -y sudo
-echo "root:${ROOT_PASSWORD}" | chpasswd
+if [[ -n "$ROOT_PASSWORD" ]]; then
+  echo "root:${ROOT_PASSWORD}" | chpasswd
+fi
 
 # The home dataset already exists; use -M, copy skel, and filter missing groups.
 IFS=',' read -ra _grps <<< "${ADMIN_GROUPS},sudo"
