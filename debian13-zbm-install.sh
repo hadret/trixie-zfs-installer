@@ -1,87 +1,8 @@
 #!/usr/bin/env bash
-#
-#==============================================================================
-# debian13-zbm-install-testing.sh
-#
-#   Debian 13 (Trixie), root on encrypted ZFS, rEFInd -> ZFSBootMenu.
-#   TESTING VARIANT: installs every ZFSBootMenu binary image you ask for
-#   (release + recovery, Linux 6.6 / 6.12 / 6.18) side by side, plus a backup
-#   copy of each release image, so you can find out empirically which one
-#   drives your hardware.
-#==============================================================================
-#
-# Based on:
-#   https://docs.zfsbootmenu.org/en/v3.1.x/guides/debian/uefi.html
-#   (encrypted variant, rEFInd boot-entry variant)
-#
-# Guide steps are tagged [GUIDE]; departures are tagged [DEVIATION].
-#
-#------------------------------------------------------------------------------
-# WHICH IMAGE IS THE RIGHT ONE? THAT IS YOUR JOB.
-#------------------------------------------------------------------------------
-# All ZFSBootMenu v3.1.0 binary images embed the SAME OpenZFS (2.4.0). The only
-# difference between the 6.6, 6.12 and 6.18 builds is the Linux kernel, i.e.
-# HARDWARE SUPPORT -- NVMe controllers, RAID HBAs, GPUs, USB controllers.
-# Picking a different kernel does NOT change ZFS capability or feature-flag
-# compatibility.
-#
-# So: install several, boot each once, and keep whichever reaches the menu
-# fastest and most reliably. This script deliberately makes no claim about
-# which will work on your machine, and none of them is marked "correct".
-#
-#   release  = normal ZFSBootMenu image
-#   recovery = same, plus networking, curl, sgdisk, cryptsetup, an SSH client.
-#              This is the one that turns "go find a live USB" into
-#              "pick the next menu entry". Install at least one.
-#   backup   = byte-identical copy of each release image, kept in its own
-#              directory so a botched in-place update cannot take out both.
-#
-#------------------------------------------------------------------------------
-# ESP LAYOUT (this is what makes rEFInd behave)
-#------------------------------------------------------------------------------
-# rEFInd auto-detects files named vmlinuz*/bzImage*/kernel* as Linux kernels,
-# and fold_linux_kernels (default true) collapses every kernel found IN THE
-# SAME DIRECTORY into ONE menu tag -- picking as primary whichever filename
-# version-sorts highest. That is why an install with VMLINUZ.EFI and
-# VMLINUZ-BACKUP.EFI in one directory shows only the backup: "-BACKUP" sorts
-# above the empty string.
-#
-# Folding is per-directory, so one directory per image sidesteps it entirely
-# while keeping the vmlinuz name that triggers autodetection:
-#
-#   /boot/efi/EFI/ZBM-6.6/vmlinuz.EFI            + refind_linux.conf
-#   /boot/efi/EFI/ZBM-6.12/vmlinuz.EFI           + refind_linux.conf
-#   /boot/efi/EFI/ZBM-6.18/vmlinuz.EFI           + refind_linux.conf
-#   /boot/efi/EFI/ZBM-RECOVERY-6.6/vmlinuz.EFI   + refind_linux.conf
-#   /boot/efi/EFI/ZBM-RECOVERY-6.12/vmlinuz.EFI  + refind_linux.conf
-#   /boot/efi/EFI/ZBM-RECOVERY-6.18/vmlinuz.EFI  + refind_linux.conf
-#   /boot/efi/EFI/ZBM-BACKUP/vmlinuz-6.6.EFI
-#                            vmlinuz-6.12.EFI    + refind_linux.conf
-#                            vmlinuz-6.18.EFI
-#
-# The backups DO share a directory on purpose: they fold into a single tag so
-# they do not clutter the menu. Press F2 or Insert on that entry to reach the
-# individual ones.
-#
-#------------------------------------------------------------------------------
-# Disk layout on $DISK (a /dev/disk/by-id/... path; GPT, fully wiped)
-#------------------------------------------------------------------------------
-#   -part1   2048 MiB (default)   ef00   ESP -> /boot/efi
-#   -part2   1024 MiB          8200/8309 encrypted swap (random-key by default)
-#   -part3   rest - 10 MiB        bf00   zroot (part2 when swap is disabled)
-#
-#------------------------------------------------------------------------------
-# Usage
-#------------------------------------------------------------------------------
-#   sudo -i
-#   DISK=/dev/disk/by-id/nvme-... ZBM_KERNELS=all ADMIN_USER=alireza \
-#   TIMEZONE=Europe/Berlin DESKTOP=kde ./debian13-zbm-install-testing.sh
-#
-# Run with DISK unset to list candidate disks.
-# Run with LIST_KEYBOARD=yes to list keyboard variants for your layout.
-#
+# Debian 13 root-on-ZFS installer using rEFInd and prebuilt ZFSBootMenu.
+# [GUIDE] follows upstream; [DEVIATION] marks intentional departures.
+# See README.md for configuration, layout, and recovery details.
 # THIS DESTROYS ALL DATA ON $DISK.
-#==============================================================================
 
 set -euo pipefail
 
@@ -102,20 +23,28 @@ fi
 
 XKB_LST="/usr/share/X11/xkb/rules/base.lst"
 
+xkb_list() {
+	local kind="$1" layout="${2:-}"
+	awk -v kind="$kind" -v layout="${layout}:" '
+		/^!/ { if ($2 == kind) { active = 1; next }; active = 0 }
+		!active || !NF { next }
+		kind == "layout" { print $1; next }
+		kind == "variant" && $2 == layout {
+			name = $1; $1 = $2 = ""; sub(/^ +/, "")
+			print name "\t" $0
+		}' "$XKB_LST"
+}
+
 list_variants() {
-	local layout="$1"
+	local layout="$1" name description
 	if [[ ! -r "$XKB_LST" ]]; then
 		echo "  (xkb-data not installed; cannot list)" >&2
 		return 0
 	fi
 	printf '  %-18s %s\n' "(none)" "standard layout for '${layout}'" >&2
-	awk -v l="${layout}:" '
-		/^! variant/ { f = 1; next }
-		/^!/         { f = 0 }
-		f && NF > 1 && $2 == l {
-			name = $1; $1 = ""; $2 = ""; sub(/^ +/, "")
-			printf "  %-18s %s\n", name, $0
-		}' "$XKB_LST" >&2
+	while IFS=$'\t' read -r name description; do
+		printf '  %-18s %s\n' "$name" "$description"
+	done < <(xkb_list variant "$layout") >&2
 	return 0
 }
 
@@ -135,83 +64,49 @@ fi
 DISK="${DISK:-}"
 
 #--- ZFSBootMenu image selection ----------------------------------------------
-# Pinned, not "latest": a testing rig should be reproducible.
+# Pinned for reproducible installs.
 ZBM_VERSION="${ZBM_VERSION:-v3.1.0}"
 ZBM_BASE_URL="${ZBM_BASE_URL:-https://github.com/zbm-dev/zfsbootmenu/releases/download}"
 
-# Which Linux kernel series to install images for.
-#   all            -> 6.6 6.12 6.18
-#   "6.12"         -> just that one
-#   "6.6 6.18"     -> any space-separated subset
+# Linux series: all, one value, or a space-separated subset.
 ZBM_KERNELS="${ZBM_KERNELS:-all}"
 
-# Install the recovery build alongside each release build. Strongly recommended:
-# the recovery image has networking and disk tooling and can rescue the system
-# without a live USB.
+# Install recovery builds alongside release builds.
 ZBM_RECOVERY="${ZBM_RECOVERY:-yes}"
 
 # Keep a second copy of every release image under EFI/ZBM-BACKUP.
 ZBM_BACKUP="${ZBM_BACKUP:-yes}"
 
-# Which release image is copied to EFI/BOOT/BOOTX64.EFI as the removable-media
-# fallback, for firmware that silently drops NVRAM boot entries. Must be one of
-# the kernels you selected. Empty disables the fallback.
+# Release image copied to EFI/BOOT/BOOTX64.EFI; empty disables it.
 ZBM_FALLBACK_KERNEL="${ZBM_FALLBACK_KERNEL:-6.12}"
 
 #--- rEFInd -------------------------------------------------------------------
-# 30 seconds is long enough to read the menu and pick an image deliberately.
-# Use 0 if you want rEFInd to wait indefinitely instead.
+# Set 0 to wait indefinitely.
 REFIND_TIMEOUT="${REFIND_TIMEOUT:-30}"
-# Left EMPTY on purpose: no image is nominated as "the" default, so rEFInd
-# highlights the first entry and lets you choose. Once you know which image
-# your hardware likes, set this to a substring of its title, e.g.
-# REFIND_DEFAULT="ZBM-6.12", or edit refind.conf afterwards.
+# Empty leaves the first rEFInd entry highlighted.
 REFIND_DEFAULT="${REFIND_DEFAULT:-}"
 
 #--- Kernel command lines -----------------------------------------------------
-# ZBM_CMDLINE     configures ZFSBootMenu's OWN kernel (via refind_linux.conf).
-# KERNEL_CMDLINE  is org.zfsbootmenu:commandline, i.e. what ZBM hands to Debian.
-# Both verbose: 'quiet' appears nowhere.
+# ZBM_CMDLINE configures ZBM; KERNEL_CMDLINE is passed to Debian.
 ZBM_CMDLINE="${ZBM_CMDLINE:-loglevel=6}"
 KERNEL_CMDLINE="${KERNEL_CMDLINE:-loglevel=6 systemd.show_status=yes}"
-# Seconds ZFSBootMenu waits on its own countdown before booting bootfs.
-# 0 boots immediately, -1 waits forever.
+# ZBM countdown: 0 boots immediately; -1 waits forever.
 ZBM_TIMEOUT="${ZBM_TIMEOUT:-30}"
 
 #--- Partition sizes (MiB) ----------------------------------------------------
-# 2048 by default: nine ZBM images run to roughly 650 MB, and you want headroom
-# to add more without repartitioning.
+# 2048 leaves room for multiple release, recovery, and backup images.
 ESP_SIZE_MIB="${ESP_SIZE_MIB:-2048}"
 SWAP_SIZE_MIB="${SWAP_SIZE_MIB:-1024}"
 
 #--- Swap ---------------------------------------------------------------------
-# luks   : persistent LUKS2, unlocked from a random 512-byte keyfile that lives
-#          on the encrypted root. Root is already open when crypttab is
-#          processed, so it never prompts. Partition type 8309 (Linux LUKS),
-#          which is what systemd expects to see on a real LUKS volume.
-# random : plain dm-crypt, fresh key from $SWAP_RANDOM_SOURCE every boot.
-#          Nothing survives a reboot. Partition type 8200 (Linux swap) --
-#          typing it 8309 makes systemd-gpt-auto-generator try to unlock it as
-#          LUKS, which fails and drags the real swap unit down with it.
-#          THIS IS THE DEFAULT.
-# none   : no swap partition at all
-#
-# Either way hibernation is not configured; RESUME=none is set below.
+# Modes: random (default), luks, or none. Hibernation is not configured.
 SWAP_MODE="${SWAP_MODE:-random}"
 SWAP_RANDOM_SOURCE="${SWAP_RANDOM_SOURCE:-/dev/urandom}"
 SWAP_CIPHER="${SWAP_CIPHER:-aes-xts-plain64}"
 SWAP_KEYSIZE="${SWAP_KEYSIZE:-512}"
 SWAP_MAPPER="${SWAP_MAPPER:-cswap}"
 
-# Install cryptsetup-initramfs when the archive provides it. Debian's hook
-# works out for itself which crypttab targets are needed early -- only those
-# backing root or resume -- so a swap volume that is neither is left out and
-# costs nothing at boot. Having the package present means a LUKS volume added
-# later can be unlocked from the initramfs with no rebuild of anything else.
-#
-# Expect update-initramfs to print "cryptsetup: WARNING: Couldn't determine
-# root device". The OpenZFS guides call this out explicitly: cryptsetup cannot
-# introspect ZFS, and the message is harmless here.
+# Install cryptsetup initramfs support when the archive provides it.
 INSTALL_CRYPTSETUP_INITRAMFS="${INSTALL_CRYPTSETUP_INITRAMFS:-yes}"
 
 #--- ZFS ----------------------------------------------------------------------
@@ -241,17 +136,13 @@ KEYBOARD_VARIANT="${KEYBOARD_VARIANT-${_LIVE_XKBVARIANT}}"
 SUITE="${SUITE:-trixie}"
 MIRROR="${MIRROR:-https://deb.debian.org/debian}"
 SECURITY_MIRROR="${SECURITY_MIRROR:-https://security.debian.org/debian-security}"
-# non-free is included here (not just non-free-firmware): it is what provides
-# intel-media-va-driver-non-free and similar.
+# non-free supplies packages such as intel-media-va-driver-non-free.
 COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
 
 ENABLE_UPDATES="${ENABLE_UPDATES:-yes}"       # ${SUITE}-updates
 ENABLE_SECURITY="${ENABLE_SECURITY:-yes}"     # ${SUITE}-security
 ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-yes}"   # Debian's native backports policy
-# ${SUITE}-proposed-updates holds packages QUEUED FOR THE NEXT POINT RELEASE.
-# It has normal priority, so enabling it means apt WILL pull from it on the next
-# upgrade. That is the point of a testing rig, but know what you are switching
-# on.
+# proposed-updates has normal priority and may be selected on upgrade.
 ENABLE_PROPOSED_UPDATES="${ENABLE_PROPOSED_UPDATES:-no}"
 
 INSTALL_FIRMWARE="${INSTALL_FIRMWARE:-yes}"
@@ -376,9 +267,7 @@ list_disks() {
 [[ $EUID -eq 0 ]] || die "Run this script as root (sudo -i)."
 [[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
 
-# Keep pool feature flags within the OpenZFS version embedded in ZFSBootMenu.
-# Unknown ZBM releases require an explicit profile: guessing here can make the
-# pool unbootable after a future zpool upgrade.
+# Keep pool features compatible with ZFSBootMenu; never guess for unknown releases.
 if [[ -z "$POOL_COMPAT" ]]; then
 	case "$ZBM_VERSION" in
 		v3.1.0)
@@ -412,9 +301,7 @@ DISK_REAL="$(readlink -f "$DISK")"
 [[ "$(lsblk -dno TYPE "$DISK_REAL")" == "disk" ]] || die "${DISK} does not resolve to a whole disk."
 
 SECURE_BOOT_EFIVAR="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-# EFI variables start with a four-byte attributes field. The following byte is
-# the SecureBoot value: 1 means enabled. A missing variable means the firmware
-# does not expose Secure Boot and is not an error for this installer.
+# SecureBoot is the byte after EFI's four-byte attribute header; missing is fine.
 if [[ -r "$SECURE_BOOT_EFIVAR" ]] \
 	&& [[ "$(od -An -tu1 -j4 -N1 "$SECURE_BOOT_EFIVAR" | tr -d '[:space:]')" == "1" ]]; then
 	die "Secure Boot is enabled. The unsigned ZFSBootMenu EFI images will not boot; disable Secure Boot and retry."
@@ -491,12 +378,11 @@ fi
 
 #--- Keyboard / locale / timezone validation ----------------------------------
 if [[ -r "$XKB_LST" ]]; then
-	if ! awk '/^! layout/{f=1;next} /^!/{f=0} f&&NF{print $1}' "$XKB_LST" | grep -qx "$KEYMAP"; then
+	if ! xkb_list layout | grep -qx "$KEYMAP"; then
 		die "KEYMAP='${KEYMAP}' is not a known XKB layout."
 	fi
 	if [[ -n "$KEYBOARD_VARIANT" ]]; then
-		if ! awk -v l="${KEYMAP}:" '/^! variant/{f=1;next} /^!/{f=0} f&&NF>1&&$2==l{print $1}' \
-			"$XKB_LST" | grep -qx "$KEYBOARD_VARIANT"; then
+		if ! xkb_list variant "$KEYMAP" | cut -f1 | grep -qx "$KEYBOARD_VARIANT"; then
 			warn "KEYBOARD_VARIANT='${KEYBOARD_VARIANT}' is not valid for layout '${KEYMAP}'."
 			echo "Valid variants for '${KEYMAP}':" >&2
 			list_variants "$KEYMAP"
@@ -581,9 +467,7 @@ log "Collecting passwords"
 [[ -n "$ROOT_PASSWORD" ]]  || prompt_pass ROOT_PASSWORD  "root password" 1
 [[ -n "$ADMIN_PASSWORD" ]] || prompt_pass ADMIN_PASSWORD "password for ${ADMIN_USER}" 1
 if [[ -z "$ZFS_PASSPHRASE" ]]; then
-	# [GUIDE] "It's critical that your passphrase be something you can type on
-	# your keyboard, since you will need to type it in to unlock the pool on
-	# boot." ZFSBootMenu uses its own minimal keymap.
+	# [GUIDE] The pool passphrase must be typeable in ZFSBootMenu's minimal keymap.
 	echo "  Typed inside ZFSBootMenu at every boot, on a basic keymap."
 	echo "  Prefer unshifted ASCII you can find blind."
 	prompt_pass ZFS_PASSPHRASE "ZFS pool passphrase" 8
@@ -593,40 +477,29 @@ fi
 # APT source generation (shared by live environment and target)
 #==============================================================================
 
-# Emits a classic one-line-per-entry sources.list to stdout.
-#   $1 = "live" (no deb-src, keeps the live ISO fast) or "target"
+APT_SUITES=("${SUITE}|${MIRROR}|")
+[[ "$ENABLE_UPDATES" == "yes" ]] \
+	&& APT_SUITES+=("${SUITE}-updates|${MIRROR}|Point-release updates")
+[[ "$ENABLE_SECURITY" == "yes" ]] \
+	&& APT_SUITES+=("${SUITE}-security|${SECURITY_MIRROR}|Security updates")
+[[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]] \
+	&& APT_SUITES+=("${SUITE}-proposed-updates|${MIRROR}|Queued for the next point release; normal priority")
+[[ "$ENABLE_BACKPORTS" == "yes" ]] \
+	&& APT_SUITES+=("${SUITE}-backports|${MIRROR}|Debian's native backports policy")
+
+# Emit sources.list; $1 is live (binary only) or target (with deb-src).
 gen_sources() {
-	local mode="$1"
-	echo "deb ${MIRROR} ${SUITE} ${COMPONENTS}"
-	[[ "$mode" == "target" ]] && echo "deb-src ${MIRROR} ${SUITE} ${COMPONENTS}"
-
-	if [[ "$ENABLE_UPDATES" == "yes" ]]; then
-		echo
-		echo "# Point-release updates"
-		echo "deb ${MIRROR} ${SUITE}-updates ${COMPONENTS}"
-		[[ "$mode" == "target" ]] && echo "deb-src ${MIRROR} ${SUITE}-updates ${COMPONENTS}"
-	fi
-
-	if [[ "$ENABLE_SECURITY" == "yes" ]]; then
-		echo
-		echo "# Security updates"
-		echo "deb ${SECURITY_MIRROR} ${SUITE}-security ${COMPONENTS}"
-		[[ "$mode" == "target" ]] && echo "deb-src ${SECURITY_MIRROR} ${SUITE}-security ${COMPONENTS}"
-	fi
-
-	if [[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]]; then
-		echo
-		echo "# Queued for the next point release. NORMAL priority: apt will use it."
-		echo "deb ${MIRROR} ${SUITE}-proposed-updates ${COMPONENTS}"
-		[[ "$mode" == "target" ]] && echo "deb-src ${MIRROR} ${SUITE}-proposed-updates ${COMPONENTS}"
-	fi
-
-	if [[ "$ENABLE_BACKPORTS" == "yes" ]]; then
-		echo
-		echo "# Backports. Debian's native NotAutomatic/ButAutomaticUpgrades policy."
-		echo "deb ${MIRROR} ${SUITE}-backports ${COMPONENTS}"
-		[[ "$mode" == "target" ]] && echo "deb-src ${MIRROR} ${SUITE}-backports ${COMPONENTS}"
-	fi
+	local mode="$1" entry suite mirror note first=yes
+	for entry in "${APT_SUITES[@]}"; do
+		IFS='|' read -r suite mirror note <<< "$entry"
+		if [[ "$first" == "no" ]]; then
+			echo
+			echo "# ${note}"
+		fi
+		echo "deb ${mirror} ${suite} ${COMPONENTS}"
+		[[ "$mode" == "target" ]] && echo "deb-src ${mirror} ${suite} ${COMPONENTS}"
+		first=no
+	done
 	return 0
 }
 
@@ -658,9 +531,7 @@ zgenhostid -f "$HOSTID"
 # [GUIDE] Disk preparation
 #==============================================================================
 
-# A pool of the same name already imported in the live environment would make
-# every later "zpool export/import ${POOL_NAME}" ambiguous, and could have the
-# script operate on the wrong pool entirely.
+# Refuse an imported same-name pool before any destructive work.
 log "Checking for an already-imported pool named ${POOL_NAME}"
 if zpool list -H -o name 2>/dev/null | grep -qx "$POOL_NAME"; then
 	echo >&2
@@ -715,9 +586,7 @@ fi
 # Pool name collision check
 #==============================================================================
 
-# Run AFTER the wipe on purpose: any previous pool on the target disk is gone
-# by now, so anything still found lives on a DIFFERENT disk and is a genuine
-# conflict rather than a leftover of the install we are replacing.
+# After the wipe, any remaining same-name pool must be on another disk.
 log "Checking other disks for a pool named ${POOL_NAME}"
 OTHER_POOL=no
 if zpool import 2>/dev/null | awk '$1 == "pool:" { print $2 }' | grep -qx "$POOL_NAME"; then
@@ -745,8 +614,7 @@ fi
 # [GUIDE] ZFS pool creation (encrypted variant)
 #==============================================================================
 
-# [GUIDE] The guide's encrypted zpool create references this key file as
-# "created in a previous step", but never shows that step.
+# [GUIDE] Create the key file referenced by the encrypted-pool step.
 log "Writing pool key to ${KEYFILE}"
 mkdir -p /etc/zfs
 LIVE_KEY_WRITTEN=yes
@@ -773,19 +641,14 @@ fi
 zpool create "${zpool_opts[@]}" -m none "$POOL_NAME" "$POOL_DEVICE"
 INSTALL_POOL_CREATED=yes
 
-# A pool's GUID is unique and unambiguous where its name is not. Everything
-# below re-imports by GUID so the script can never grab a same-named pool that
-# happens to live on another disk.
+# Re-import by GUID so a same-named pool on another disk cannot be selected.
 POOL_GUID="$(zpool get -H -o value guid "$POOL_NAME")"
 [[ -n "$POOL_GUID" ]] || die "Could not read the GUID of the new pool."
 INSTALL_POOL_GUID="$POOL_GUID"
 echo "  pool GUID: ${POOL_GUID}"
 
-#------------------------------------------------------------------------------
 # [GUIDE] Create initial file systems
-# "canmount is not inheritable ... It is necessary to explicitly set
-#  canmount=noauto on every boot environment you create."
-#------------------------------------------------------------------------------
+# Set canmount=noauto explicitly because canmount is not inherited.
 
 log "Creating boot environment datasets"
 zfs create -o mountpoint=none -o canmount=off    "${POOL_NAME}/ROOT"
@@ -814,7 +677,6 @@ zfs create -o mountpoint=/var/tmp                "${POOL_NAME}/data/var/tmp"
 
 if [[ "$DATASET_TUNING" == "yes" ]]; then
 	log "Applying per-dataset tuning"
-	zfs set atime=off                       "${POOL_NAME}/data/var"
 	zfs set setuid=off devices=off          "${POOL_NAME}/data/var/tmp"
 	zfs set compression=zstd recordsize=64K "${POOL_NAME}/data/var/log"
 	zfs set recordsize=64K                  "${POOL_NAME}/data/var/lib/libvirt"
@@ -829,18 +691,9 @@ fi
 log "Exporting and re-importing at /mnt"
 zpool export "$POOL_NAME"
 
-# [DEVIATION] The guide does: zpool import -N -R /mnt zroot
-# Importing by NAME picks whichever pool of that name the scan finds first,
-# which is a coin toss when a second pool shares the name -- and the failure
-# mode is importing, and then installing over, the wrong pool.
-#
-# Two changes make this deterministic:
-#   -d "$POOL_DEVICE"  restricts the device scan to the partition just created
-#   "$POOL_GUID"       identifies the pool by its unique GUID, not its name
+# [DEVIATION] Import by GUID, with the scan restricted to $POOL_DEVICE.
 if ! zpool import -N -R /mnt -d "$POOL_DEVICE" "$POOL_GUID"; then
-	# Some setups do not accept a bare device path for -d. Widen the search to
-	# the by-id directory but keep identifying the pool by GUID, so the fallback
-	# is still incapable of grabbing a same-named pool.
+	# Fall back to the by-id directory while retaining GUID identity.
 	warn "Import with -d ${POOL_DEVICE} failed; retrying against /dev/disk/by-id"
 	zpool import -N -R /mnt -d /dev/disk/by-id "$POOL_GUID" \
 		|| die "Could not import pool ${POOL_GUID}."
@@ -906,61 +759,21 @@ gen_sources target > /mnt/root/sources.list.new
 install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub
 
 INSTALL_ENV_WRITTEN=yes
-{
-	printf 'POOL_NAME=%q\n'              "$POOL_NAME"
-	printf 'BE_NAME=%q\n'                "$BE_NAME"
-	printf 'KEYFILE=%q\n'                "$KEYFILE"
-	printf 'TARGET_HOSTNAME=%q\n'        "$TARGET_HOSTNAME"
-	printf 'ADMIN_USER=%q\n'             "$ADMIN_USER"
-	printf 'ADMIN_FULLNAME=%q\n'         "$ADMIN_FULLNAME"
-	printf 'ADMIN_GROUPS=%q\n'           "$ADMIN_GROUPS"
-	printf 'ROOT_PASSWORD=%q\n'          "$ROOT_PASSWORD"
-	printf 'ADMIN_PASSWORD=%q\n'         "$ADMIN_PASSWORD"
-	printf 'TIMEZONE=%q\n'               "$TIMEZONE"
-	printf 'LOCALE=%q\n'                 "$LOCALE"
-	printf 'KEYMAP=%q\n'                 "$KEYMAP"
-	printf 'KEYBOARD_VARIANT=%q\n'       "$KEYBOARD_VARIANT"
-	printf 'SUITE=%q\n'                  "$SUITE"
-	printf 'ENABLE_BACKPORTS=%q\n'       "$ENABLE_BACKPORTS"
-	printf 'INSTALL_FIRMWARE=%q\n'       "$INSTALL_FIRMWARE"
-	printf 'EXTRA_PACKAGES=%q\n'         "$EXTRA_PACKAGES"
-	printf 'DESKTOP=%q\n'                "$DESKTOP"
-	printf 'DESKTOP_SIZE=%q\n'           "$DESKTOP_SIZE"
-	printf 'DESKTOP_EXTRAS=%q\n'         "$DESKTOP_EXTRAS"
-	printf 'INSTALL_MEDIA_ACCEL=%q\n'    "$INSTALL_MEDIA_ACCEL"
-	printf 'INSTALL_FLATPAK=%q\n'        "$INSTALL_FLATPAK"
-	printf 'INSTALL_OFFICE=%q\n'         "$INSTALL_OFFICE"
-	printf 'INSTALL_UNATTENDED_UPGRADES=%q\n' "$INSTALL_UNATTENDED_UPGRADES"
-	printf 'BOOT_DEVICE=%q\n'            "$BOOT_DEVICE"
-	printf 'SWAP_DEVICE=%q\n'            "$SWAP_DEVICE"
-	printf 'SWAP_SIZE_MIB=%q\n'          "$SWAP_SIZE_MIB"
-	printf 'SWAP_MODE=%q\n'              "$SWAP_MODE"
-	printf 'SWAP_RANDOM_SOURCE=%q\n'     "$SWAP_RANDOM_SOURCE"
-	printf 'SWAP_CIPHER=%q\n'            "$SWAP_CIPHER"
-	printf 'SWAP_KEYSIZE=%q\n'           "$SWAP_KEYSIZE"
-	printf 'SWAP_MAPPER=%q\n'            "$SWAP_MAPPER"
-	printf 'INSTALL_CRYPTSETUP_INITRAMFS=%q\n'            "$INSTALL_CRYPTSETUP_INITRAMFS"
-	printf 'ZBM_VERSION=%q\n'            "$ZBM_VERSION"
-	printf 'ZBM_BASE_URL=%q\n'           "$ZBM_BASE_URL"
-	printf 'ZBM_KERNEL_LIST=%q\n'        "${SELECTED_KERNELS[*]}"
-	printf 'ZBM_RECOVERY=%q\n'           "$ZBM_RECOVERY"
-	printf 'ZBM_BACKUP=%q\n'             "$ZBM_BACKUP"
-	printf 'ZBM_FALLBACK_KERNEL=%q\n'    "$ZBM_FALLBACK_KERNEL"
-	printf 'ZBM_CMDLINE=%q\n'            "$ZBM_CMDLINE"
-	printf 'ZBM_TIMEOUT=%q\n'            "$ZBM_TIMEOUT"
-	printf 'KERNEL_CMDLINE=%q\n'         "$KERNEL_CMDLINE"
-	printf 'REFIND_DEFAULT=%q\n'         "$REFIND_DEFAULT"
-	printf 'REFIND_TIMEOUT=%q\n'         "$REFIND_TIMEOUT"
-} > /mnt/run/zbm-install.env
+declare -p POOL_NAME BE_NAME KEYFILE TARGET_HOSTNAME ADMIN_USER ADMIN_FULLNAME \
+	ADMIN_GROUPS ROOT_PASSWORD ADMIN_PASSWORD TIMEZONE LOCALE KEYMAP \
+	KEYBOARD_VARIANT SUITE INSTALL_FIRMWARE EXTRA_PACKAGES DESKTOP DESKTOP_SIZE \
+	DESKTOP_EXTRAS INSTALL_MEDIA_ACCEL INSTALL_FLATPAK INSTALL_OFFICE \
+	INSTALL_UNATTENDED_UPGRADES BOOT_DEVICE SWAP_DEVICE SWAP_SIZE_MIB SWAP_MODE \
+	SWAP_RANDOM_SOURCE SWAP_CIPHER SWAP_KEYSIZE SWAP_MAPPER \
+	INSTALL_CRYPTSETUP_INITRAMFS ZBM_VERSION ZBM_BASE_URL ZBM_RECOVERY ZBM_BACKUP \
+	ZBM_FALLBACK_KERNEL ZBM_CMDLINE ZBM_TIMEOUT KERNEL_CMDLINE REFIND_DEFAULT \
+	REFIND_TIMEOUT SELECTED_KERNELS BPO > /mnt/run/zbm-install.env
 chmod 600 /mnt/run/zbm-install.env
 
 cat > /mnt/root/zbm-chroot.sh <<'CHROOT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /run/zbm-install.env
-
-BPO=()
-[[ "$ENABLE_BACKPORTS" == "yes" ]] && BPO=(-t "${SUITE}-backports")
 
 WARNFILE=/root/INSTALL-WARNINGS.txt
 
@@ -970,23 +783,19 @@ warn() {
 	printf '%s\n' "$*" >> "$WARNFILE"
 }
 die() {
-	warn "$*"
+	printf '%s\n' "$*" >> "$WARNFILE"
 	printf '\033[1;31m [X]\033[0m FATAL: %s\n' "$*" >&2
 	exit 1
 }
 
 export DEBIAN_FRONTEND=noninteractive
 
-# The ZFS key under /etc/zfs is included in every initramfs. Set this before
-# installing a kernel or initramfs-tools so even package-triggered images are
-# created root-only, not with Debian's usual world-readable mode.
+# Set initramfs umask before package triggers can embed the ZFS key.
 install -d -m 0755 /etc/initramfs-tools/conf.d
 printf 'UMASK=0077\n' > /etc/initramfs-tools/conf.d/umask.conf
-chmod 0644 /etc/initramfs-tools/conf.d/umask.conf
+printf 'RESUME=none\n' > /etc/initramfs-tools/conf.d/resume
 
-# Install only the packages that actually exist in the archive. Debian renames
-# and splits packages between releases (firmware and font packages especially),
-# and one bad name would otherwise abort the whole apt run.
+# Install only packages present in this suite's archive.
 apt_install_available() {
 	local label="$1"; shift
 	local avail=() p
@@ -1054,19 +863,8 @@ echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
 
 #--- Microcode and firmware ---------------------------------------------------
 if [[ "$INSTALL_FIRMWARE" == "yes" ]]; then
-	log "Installing CPU microcode"
-	CPU_VENDOR="$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo || true)"
-	case "$CPU_VENDOR" in
-		GenuineIntel) apt install -y intel-microcode ;;
-		AuthenticAMD) apt install -y amd64-microcode ;;
-		*) warn "Unrecognised CPU vendor '${CPU_VENDOR}'; installing both."
-		   apt install -y intel-microcode amd64-microcode || true ;;
-	esac
-
 	log "Installing device firmware"
-	# firmware-linux covers graphics/misc only; wireless/sound/NIC firmware are
-	# separate packages nothing depends on, so an Intel wifi laptop has no
-	# network at all unless firmware-iwlwifi is named explicitly.
+	# Include wireless, sound, and NIC firmware not pulled by firmware-linux.
 	apt_install_available "firmware" \
 		firmware-linux firmware-linux-free firmware-linux-nonfree \
 		firmware-misc-nonfree \
@@ -1082,39 +880,18 @@ fi
 
 #--- [GUIDE] ZFS systemd services ---------------------------------------------
 log "Enabling ZFS systemd units"
-systemctl enable zfs.target
-systemctl enable zfs-import-cache
-systemctl enable zfs-mount
-systemctl enable zfs-import.target
-systemctl enable zfs-zed
-
-#--- [GUIDE] Rebuild the initramfs --------------------------------------------
-# The pool key lives in /etc/zfs and is therefore pulled into the initramfs
-# automatically, which is what lets the kernel mount an encrypted root after
-# ZFSBootMenu has already loaded the key.
-log "Rebuilding initramfs"
-update-initramfs -c -k all
-
-if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
-	&& [[ -n "$_insecure_initrd" ]]; then
-	die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
-fi
+systemctl enable zfs.target zfs-import-cache zfs-mount zfs-import.target zfs-zed
 
 #--- Encrypted swap -----------------------------------------------------------
 if [[ "$SWAP_MODE" != "none" ]]; then
 	log "Configuring encrypted swap (${SWAP_MODE})"
-	# --no-install-recommends so the dependency set stays deliberate rather than
-	# whatever Recommends happens to pull in; cryptsetup-initramfs is then added
-	# explicitly below if INSTALL_CRYPTSETUP_INITRAMFS says so.
+	# Keep dependencies deliberate; cryptsetup-initramfs is handled below.
 	apt install -y --no-install-recommends cryptsetup cryptsetup-bin
 	apt install -y systemd-cryptsetup 2>/dev/null || true
 
-	CSI_INSTALLED=no
 	if [[ "$INSTALL_CRYPTSETUP_INITRAMFS" == "yes" ]]; then
 		if apt-cache show cryptsetup-initramfs >/dev/null 2>&1; then
-			if apt install -y cryptsetup-initramfs; then
-				CSI_INSTALLED=yes
-			else
+			if ! apt install -y cryptsetup-initramfs; then
 				warn "cryptsetup-initramfs failed to install."
 			fi
 		else
@@ -1160,59 +937,22 @@ ${SWAP_MAPPER}	/dev/disk/by-partuuid/${SWAP_PARTUUID}	${SWAP_RANDOM_SOURCE}	swap
 EOF
 	fi
 
-	# 'sw' alone is not enough. The fstab generator makes dev-mapper-cswap.swap
-	# Require the device, but nothing states that the device only appears after
-	# systemd-cryptsetup@ has run -- so systemd can wait the full 90s
-	# DefaultTimeoutStartSec and then fail. x-systemd.requires makes the
-	# ordering explicit; nofail means a swap problem never blocks boot.
+	# Require systemd-cryptsetup explicitly; never let swap failure block boot.
 	echo "/dev/mapper/${SWAP_MAPPER}	none	swap	sw,nofail,x-systemd.requires=systemd-cryptsetup@${SWAP_MAPPER}.service	0	0" >> /etc/fstab
 fi
-# Nothing on a random-key swap survives a reboot, so resuming is impossible.
-# Without this the boot hangs for 30s waiting for a resume device.
-mkdir -p /etc/initramfs-tools/conf.d
-echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
 
-# The initramfs was built before crypttab and RESUME existed, and installing
-# cryptsetup-initramfs adds a hook. Rebuild so all three are reflected.
-# "cryptsetup: WARNING: Couldn't determine root device" here is expected and
-# harmless: root is ZFS, which cryptsetup cannot introspect.
-if [[ "${CSI_INSTALLED:-no}" == "yes" || "${SWAP_MODE:-none}" != "none" ]]; then
-	log "Rebuilding initramfs after crypt/resume configuration"
-	update-initramfs -u -k all
-fi
+# [GUIDE] Build the final key-bearing initramfs after crypttab is complete.
+log "Rebuilding final initramfs"
+update-initramfs -u -k all
 
 if _insecure_initrd="$(find /boot -maxdepth 1 -type f -name 'initrd.img-*' -perm /077 -print -quit)" \
 	&& [[ -n "$_insecure_initrd" ]]; then
 	die "Initramfs is accessible by group/other despite UMASK=0077: ${_insecure_initrd}"
 fi
-
-# The swap volume must NOT end up inside the initramfs. Its keyfile lives on the
-# root filesystem, which is not mounted that early, so an included target would
-# fall back to prompting for a passphrase that does not exist -- and the boot
-# would hang there. Debian's hook only pulls in targets backing root or resume,
-# and ours is neither, but root here is ZFS which the hook cannot introspect, so
-# verify rather than assume.
-if [[ "${CSI_INSTALLED:-no}" == "yes" && "${SWAP_MODE:-none}" != "none" ]]; then
-	for _img in /boot/initrd.img-*; do
-		[[ -f "$_img" ]] || continue
-		if lsinitramfs "$_img" 2>/dev/null | grep -q 'cryptroot/crypttab'; then
-			if lsinitramfs -l "$_img" 2>/dev/null | grep -q "$SWAP_MAPPER"; then
-				warn "${_img##*/} may contain the ${SWAP_MAPPER} crypt target."
-				warn "If boot stops asking for a passphrase, set CRYPTSETUP=n in"
-				warn "/etc/cryptsetup-initramfs/conf-hook and rerun update-initramfs -u -k all."
-			fi
-		fi
-	done
-fi
-
 #--- [GUIDE] ZFSBootMenu dataset properties -----------------------------------
 log "Setting ZFSBootMenu dataset properties"
 
-# Hostid is left entirely to ZFSBootMenu. zbm.set_hostid is enabled by default
-# and makes ZBM set spl.spl_hostid for the booted environment to the hostid it
-# actually imported the pool with; it also strips any spl_hostid set here. The
-# thing that matters on Debian is /etc/hostid inside the initramfs, which
-# zgenhostid + the copy into /etc before update-initramfs already provides.
+# Let ZFSBootMenu set spl_hostid; Debian already has /etc/hostid in initramfs.
 zfs set "org.zfsbootmenu:commandline=${KERNEL_CMDLINE}" "${POOL_NAME}/ROOT"
 zfs set "org.zfsbootmenu:keysource=${POOL_NAME}/ROOT/${BE_NAME}" "$POOL_NAME"
 zfs get -o property,value org.zfsbootmenu:commandline "${POOL_NAME}/ROOT"
@@ -1245,45 +985,9 @@ download_zbm_asset() {
 	mv "$part" "$dest"
 }
 
-download_zbm_asset sha256.txt || die "Could not download ${ZBM_RELEASE_URL}/sha256.txt"
 download_zbm_asset sha256.sig || die "Could not download ${ZBM_RELEASE_URL}/sha256.sig"
 
-# -V proves that sha256.txt is exactly the manifest signed by the vendored key.
-# -C below then authenticates each downloaded EFI against that signed manifest.
-signify-openbsd -V -p "$ZBM_SIGNIFY_KEY" \
-	-x "${ZBM_DOWNLOAD_DIR}/sha256.sig" \
-	-m "${ZBM_DOWNLOAD_DIR}/sha256.txt" \
-	|| die "ZFSBootMenu ${ZBM_VERSION} checksum manifest signature is invalid."
-
-# fetch_zbm <build> <kernel> <destination>
-#   build = release | recovery
-fetch_zbm() {
-	local build="$1" kern="$2" dest="$3"
-	local fname="zfsbootmenu-${build}-x86_64-${ZBM_VERSION}-linux${kern}.EFI"
-	local url="${ZBM_RELEASE_URL}/${fname}"
-	local tmp="${ZBM_DOWNLOAD_DIR}/${fname}"
-
-	if [[ ! -f "$tmp" ]]; then
-		echo "  fetching ${fname}"
-		download_zbm_asset "$fname" \
-			|| { echo "download failed: $url" >&2; return 1; }
-	fi
-	if ! (cd "$ZBM_DOWNLOAD_DIR" && signify-openbsd -C \
-		-p "$ZBM_SIGNIFY_KEY" -x sha256.sig "$fname"); then
-		rm -f "$tmp"
-		die "Signature or checksum verification failed for ${fname}."
-	fi
-
-	install -D -m 0644 "$tmp" "$dest"
-	return 0
-}
-
-# Each image gets its own directory. rEFInd folds kernels only WITHIN a
-# directory, so this keeps the vmlinuz name (which is what makes rEFInd
-# recognise it as a Linux kernel and apply refind_linux.conf) while still
-# giving every image its own top-level menu entry.
-#
-# write_rlc <directory> <label>
+# One directory per image prevents rEFInd folding; args: directory, label.
 write_rlc() {
 	local dir="$1" label="$2"
 	cat > "${dir}/refind_linux.conf" <<EOF
@@ -1295,54 +999,50 @@ EOF
 	return 0
 }
 
-INSTALLED_IMAGES=()
+ZBM_FILES=()
 
-for KV in $ZBM_KERNEL_LIST; do
-	log "ZFSBootMenu image set for Linux ${KV}"
-
-	# Release image -> EFI/ZBM-<ver>/vmlinuz.EFI
-	if fetch_zbm release "$KV" "/boot/efi/EFI/ZBM-${KV}/vmlinuz.EFI"; then
-		write_rlc "/boot/efi/EFI/ZBM-${KV}" "ZBM ${KV}"
-		INSTALLED_IMAGES+=("EFI/ZBM-${KV}/vmlinuz.EFI")
-	else
-		warn "Release image for Linux ${KV} could not be installed."
-	fi
-
-	# Recovery image -> EFI/ZBM-RECOVERY-<ver>/vmlinuz.EFI
+for KV in "${SELECTED_KERNELS[@]}"; do
+	release="zfsbootmenu-release-x86_64-${ZBM_VERSION}-linux${KV}.EFI"
+	ZBM_FILES+=("$release")
+	echo "  fetching ${release}"
+	download_zbm_asset "$release" || die "Could not download ${ZBM_RELEASE_URL}/${release}"
 	if [[ "$ZBM_RECOVERY" == "yes" ]]; then
-		if fetch_zbm recovery "$KV" "/boot/efi/EFI/ZBM-RECOVERY-${KV}/vmlinuz.EFI"; then
-			write_rlc "/boot/efi/EFI/ZBM-RECOVERY-${KV}" "ZBM RECOVERY ${KV}"
-			INSTALLED_IMAGES+=("EFI/ZBM-RECOVERY-${KV}/vmlinuz.EFI")
-		else
-			warn "Recovery image for Linux ${KV} could not be installed."
-		fi
+		recovery="zfsbootmenu-recovery-x86_64-${ZBM_VERSION}-linux${KV}.EFI"
+		ZBM_FILES+=("$recovery")
+		echo "  fetching ${recovery}"
+		download_zbm_asset "$recovery" || die "Could not download ${ZBM_RELEASE_URL}/${recovery}"
+	fi
+done
+
+(cd "$ZBM_DOWNLOAD_DIR" && signify-openbsd -C \
+	-p "$ZBM_SIGNIFY_KEY" -x sha256.sig "${ZBM_FILES[@]}") \
+	|| die "ZFSBootMenu ${ZBM_VERSION} signature or checksum verification failed."
+
+for KV in "${SELECTED_KERNELS[@]}"; do
+	log "Installing ZFSBootMenu image set for Linux ${KV}"
+	release="zfsbootmenu-release-x86_64-${ZBM_VERSION}-linux${KV}.EFI"
+	install -D -m 0644 "${ZBM_DOWNLOAD_DIR}/${release}" "/boot/efi/EFI/ZBM-${KV}/vmlinuz.EFI"
+	write_rlc "/boot/efi/EFI/ZBM-${KV}" "ZBM ${KV}"
+
+	if [[ "$ZBM_RECOVERY" == "yes" ]]; then
+		recovery="zfsbootmenu-recovery-x86_64-${ZBM_VERSION}-linux${KV}.EFI"
+		install -D -m 0644 "${ZBM_DOWNLOAD_DIR}/${recovery}" \
+			"/boot/efi/EFI/ZBM-RECOVERY-${KV}/vmlinuz.EFI"
+		write_rlc "/boot/efi/EFI/ZBM-RECOVERY-${KV}" "ZBM RECOVERY ${KV}"
 	fi
 
 	# Backup copy of the release image, in a shared directory. These DO fold
 	# into one rEFInd tag on purpose; press F2/Insert to reach the others.
 	if [[ "$ZBM_BACKUP" == "yes" ]]; then
-		if [[ -f "/boot/efi/EFI/ZBM-${KV}/vmlinuz.EFI" ]]; then
-			mkdir -p /boot/efi/EFI/ZBM-BACKUP
-			cp "/boot/efi/EFI/ZBM-${KV}/vmlinuz.EFI" \
-			   "/boot/efi/EFI/ZBM-BACKUP/vmlinuz-${KV}.EFI"
-			INSTALLED_IMAGES+=("EFI/ZBM-BACKUP/vmlinuz-${KV}.EFI")
-		fi
+		mkdir -p /boot/efi/EFI/ZBM-BACKUP
+		cp "/boot/efi/EFI/ZBM-${KV}/vmlinuz.EFI" \
+		   "/boot/efi/EFI/ZBM-BACKUP/vmlinuz-${KV}.EFI"
 	fi
 done
 
 if [[ -d /boot/efi/EFI/ZBM-BACKUP ]]; then
 	write_rlc /boot/efi/EFI/ZBM-BACKUP "ZBM BACKUP"
 fi
-
-if (( ${#INSTALLED_IMAGES[@]} == 0 )); then
-	echo "No ZFSBootMenu images were installed. The system will not boot." >&2
-	exit 1
-fi
-
-# Removable-media fallback deferred: refind-install may itself claim
-# EFI/BOOT/BOOTX64.EFI, and rEFInd there is strictly better than ZBM there
-# (you get the whole menu instead of one hard-wired image). Handled after
-# rEFInd is installed, further down.
 
 find "$ZBM_DOWNLOAD_DIR" -maxdepth 1 -type f -delete
 rmdir "$ZBM_DOWNLOAD_DIR"
@@ -1365,49 +1065,25 @@ if ! refind-install; then
 	warn "or repair from a live ISO."
 fi
 
-# [GUIDE] refind-install writes /boot/refind_linux.conf, which would make
-# rEFInd generate entries for the Debian kernel directly and bypass
-# ZFSBootMenu entirely.
+# [GUIDE] Remove direct Debian-kernel entries that bypass ZFSBootMenu.
 rm -f /boot/refind_linux.conf
 
 REFIND_CONF=/boot/efi/EFI/refind/refind.conf
 if [[ -f "$REFIND_CONF" ]]; then
 	{
 		echo ""
-		echo "#--- added by debian13-zbm-install-testing.sh ------------------------------"
-		echo "# 0 = wait indefinitely. Nothing auto-boots: every ZFSBootMenu image is"
-		echo "# listed and you choose. Set a positive number for a countdown once you"
-		echo "# have decided which image to keep."
+		echo "# Added by debian13-zbm-install.sh"
 		echo "timeout ${REFIND_TIMEOUT}"
-		echo ""
-		echo "# Left at the default (true) deliberately. Every ZBM image lives in its"
-		echo "# own directory, so folding has nothing to group -- except the backups,"
-		echo "# which share EFI/ZBM-BACKUP and collapse into a single tag on purpose."
-		echo "# Press F2 or Insert on that entry to reach the individual backups."
-		echo "fold_linux_kernels true"
-		echo ""
-		echo "# EFI/BOOT is scanned too. Whatever claimed BOOTX64.EFI shows up in the"
-		echo "# menu and can be tested like any other entry (rEFInd skips its own)."
 		if [[ -n "$REFIND_DEFAULT" ]]; then
-			echo ""
 			echo "default_selection \"${REFIND_DEFAULT}\""
-		else
-			echo ""
-			echo "# No default_selection: no image is nominated as correct. Add one"
-			echo "# yourself once testing tells you which to trust, e.g."
-			echo "#   default_selection \"ZBM-6.12\""
 		fi
-		echo "#--------------------------------------------------------------------------"
 	} >> "$REFIND_CONF"
 else
 	warn "${REFIND_CONF} not found; rEFInd settings were not applied."
 fi
 
 #--- Removable-media fallback -------------------------------------------------
-# Some firmware silently drops NVRAM boot entries and will only start
-# EFI/BOOT/BOOTX64.EFI. refind-install often puts rEFInd there itself, which is
-# the better outcome: you reach the full menu rather than one hard-wired image.
-# So only fill the slot if it is still empty.
+# Fill BOOTX64.EFI only when refind-install leaves the fallback slot empty.
 if [[ -e /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
 	log "EFI/BOOT/BOOTX64.EFI already present (installed by refind-install); left alone"
 elif [[ -n "$ZBM_FALLBACK_KERNEL" && -f "/boot/efi/EFI/ZBM-${ZBM_FALLBACK_KERNEL}/vmlinuz.EFI" ]]; then
@@ -1428,49 +1104,18 @@ log "Creating accounts"
 apt install -y sudo
 echo "root:${ROOT_PASSWORD}" | chpasswd
 
-# /home/${ADMIN_USER} already exists as a mounted dataset. useradd -m REFUSES
-# to populate a directory that already exists -- it prints "Not copying any
-# file from skel directory into it" and carries on, silently leaving the
-# account with no .bashrc or .profile. So use -M and copy skel by hand.
-# useradd ABORTS if any group in -G does not exist, which would leave the
-# system with no user account at all. Keep only the groups that are really
-# present (e.g. lpadmin only exists once cups is installed).
-WANTED_GROUPS="${ADMIN_GROUPS},sudo"
-REAL_GROUPS=""
-IFS=',' read -ra _grps <<< "$WANTED_GROUPS"
-for _g in "${_grps[@]}"; do
-	[[ -z "$_g" ]] && continue
-	if getent group "$_g" >/dev/null 2>&1; then
-		REAL_GROUPS="${REAL_GROUPS:+${REAL_GROUPS},}${_g}"
-	else
-		echo "    skip (no such group): ${_g}"
-	fi
-done
+# The home dataset already exists; use -M, copy skel, and filter missing groups.
+IFS=',' read -ra _grps <<< "${ADMIN_GROUPS},sudo"
+REAL_GROUPS="$(getent group "${_grps[@]}" 2>/dev/null \
+	| cut -d: -f1 | paste -sd, || true)"
 echo "  groups: ${REAL_GROUPS}"
 
-# useradd -G "" is an error, so drop the flag entirely if nothing survived.
-if [[ -n "$REAL_GROUPS" ]]; then
-	useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
-		-c "$ADMIN_FULLNAME" -G "$REAL_GROUPS" "$ADMIN_USER"
-else
-	warn "No supplementary groups exist; creating ${ADMIN_USER} without any."
-	useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
-		-c "$ADMIN_FULLNAME" "$ADMIN_USER"
-fi
-
-# sudo is the one group that must be there. If it went missing the account
-# would be unable to administer the machine, and root login is the only way back.
-if ! id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then
-	warn "${ADMIN_USER} is NOT in the sudo group. Use the root account to fix this."
-fi
+useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
+	-c "$ADMIN_FULLNAME" -G "$REAL_GROUPS" "$ADMIN_USER"
 cp -a /etc/skel/. "/home/${ADMIN_USER}/"
 echo "${ADMIN_USER}:${ADMIN_PASSWORD}" | chpasswd
 chown -R "${ADMIN_USER}:${ADMIN_USER}" "/home/${ADMIN_USER}"
 chmod 0750 "/home/${ADMIN_USER}"
-
-if [[ ! -f "/home/${ADMIN_USER}/.bashrc" ]]; then
-	warn "/home/${ADMIN_USER}/.bashrc missing -- skel copy did not work."
-fi
 
 #==============================================================================
 # Base userland
@@ -1538,8 +1183,7 @@ if [[ "$DESKTOP" != "none" && "$DESKTOP_EXTRAS" == "yes" ]]; then
 
 	apt_install_available "bluetooth" bluez
 
-	# Fonts, emoji and printing (cups/avahi) are deliberately NOT installed.
-	# The command to add them is printed at the end of this script.
+	# Fonts, emoji and printing are documented as optional in README.md.
 
 	# The rough equivalent of ubuntu-restricted-extras' codec half.
 	apt_install_available "codecs" \
@@ -1674,133 +1318,38 @@ Installation complete. Remove the live medium and reboot.
 
 $( [[ "$OTHER_POOL" == yes ]] && printf '%s\n' \
 "POOL NAME COLLISION -- READ THIS" \
-"  Another pool named '${POOL_NAME}' exists on a different disk in this machine." \
-"  Only one pool of a given name can be imported at a time, so ZFSBootMenu will" \
-"  see both and use only one of them. If the wrong one wins you will not boot." \
-"  Either disconnect or rename the other pool, or reinstall with a unique" \
-"  POOL_NAME. To rename the OTHER pool from a live ISO:" \
+"  Another disk contains a pool named '${POOL_NAME}'; only one can be imported." \
+"  Disconnect or rename the other pool, or reinstall with a unique POOL_NAME." \
 "      zpool export ${POOL_NAME}" \
 "      zpool import <guid-of-the-other-pool> othername" \
 "" )
-WHAT YOU WILL SEE
+BOOT PATH
   firmware -> rEFInd -> (a ZFSBootMenu image you pick) -> ${POOL_NAME}/ROOT/${BE_NAME}
 
-  rEFInd lists one entry per ZFSBootMenu image, plus one folded entry for the
-  backups and one for the EFI/BOOT fallback copy. Nothing is marked default and
-  the timeout is ${REFIND_TIMEOUT} (0 = wait forever), so the menu sits there until you
-  choose. Each entry has four sub-entries (F2 or Insert to open):
-      boot default      ${ZBM_TIMEOUT}s countdown, then boots bootfs
-      boot to menu      always show the boot-environment selector
-      boot immediately  no menu, no countdown
-      verbose debug     loglevel=7, ZBM's full internal tracing
-
-NOW GO FIND OUT WHICH IMAGE WORKS
   Kernels installed: ${SELECTED_KERNELS[*]}
-
-  All of these embed the SAME OpenZFS. They differ only in Linux kernel, so
-  the question is purely whether the kernel can see your disk controller,
-  keyboard and display. Boot each once and note:
-
-    - does it reach the ZFSBootMenu prompt at all?
-    - is your keyboard usable at the passphrase prompt?
-    - does it find and import ${POOL_NAME}?
-    - how long does it take?
-
-  Then pin your winner by adding a default_selection to refind.conf:
+  Boot each image once, then pin the winner in refind.conf:
     sudo nano /boot/efi/EFI/refind/refind.conf
       default_selection "ZBM-6.12"
       timeout 5
-  and, if you want the firmware fallback to match:
-    sudo cp /boot/efi/EFI/ZBM-<ver>/vmlinuz.EFI /boot/efi/EFI/BOOT/BOOTX64.EFI
-
-  Removing the images you rejected is just deleting their directory under
-  /boot/efi/EFI/ -- rEFInd rescans the ESP on every boot, nothing to regenerate.
-
-NOT INSTALLED, ON PURPOSE
-  Fonts, emoji and printing were left out. Run these if you want them:
-
-    # Fonts and emoji
-    sudo apt install fonts-noto-core fonts-noto-color-emoji fonts-liberation2 \\
-        fonts-dejavu-core fonts-hack
-
-    # Printing, with automatic network printer discovery
-    sudo apt install cups cups-filters cups-browsed avahi-daemon$( [[ "$DESKTOP" == kde ]] && echo " print-manager" )$( [[ "$DESKTOP" == gnome ]] && echo " system-config-printer" )
-    sudo usermod -a -G lpadmin ${ADMIN_USER}
-
-  (The lpadmin group is created by cups, so add yourself to it AFTER the
-  install above, not before -- it does not exist yet.)
 
 RECOVERY IMAGES
-  EFI/ZBM-RECOVERY-* include networking, curl, sgdisk and cryptsetup. Keep at
-  least one even after you have picked a favourite: it is the difference
-  between fixing a broken pool from the boot menu and going to find a USB
-  stick.
-
-BOOT VERBOSITY
-  'quiet' is set nowhere.
-    ZFSBootMenu's own kernel : ${ZBM_CMDLINE}
-    Debian's kernel          : ${KERNEL_CMDLINE}
-
-  Change Debian's verbosity without touching the bootloader:
-    sudo zfs set org.zfsbootmenu:commandline="loglevel=7 systemd.show_status=yes" ${POOL_NAME}/ROOT
-  Change ZFSBootMenu's own: edit the refind_linux.conf inside each
-  /boot/efi/EFI/ZBM-*/ directory. No regeneration needed.
-
-APT SUITES ENABLED
-  ${SUITE}$( [[ "$ENABLE_UPDATES" == yes ]] && echo ", ${SUITE}-updates" )$( [[ "$ENABLE_SECURITY" == yes ]] && echo ", ${SUITE}-security" )$( [[ "$ENABLE_PROPOSED_UPDATES" == yes ]] && echo ", ${SUITE}-proposed-updates" )$( [[ "$ENABLE_BACKPORTS" == yes ]] && echo ", ${SUITE}-backports" )
-  Components: ${COMPONENTS}
-
-  Backports follows Debian's native low-priority policy. When enabled, this
-  installer explicitly seeded ZFS from backports; future backports upgrades to
-  those installed packages are then selected automatically.
-
-    # If backports was disabled, add its source and seed packages explicitly:
-    echo "deb ${MIRROR} ${SUITE}-backports ${COMPONENTS}" \\
-        | sudo tee /etc/apt/sources.list.d/${SUITE}-backports.list
-    sudo apt update
-    sudo apt install -t ${SUITE}-backports zfs-dkms zfsutils-linux zfs-initramfs
-
-    # Proposed-updates is configured only when ENABLE_PROPOSED_UPDATES=yes.
-    # It contains packages queued for the next point release.
-    # NORMAL priority -- once added, 'apt upgrade' WILL pull from it.
-    echo "deb ${MIRROR} ${SUITE}-proposed-updates ${COMPONENTS}" \\
-        | sudo tee /etc/apt/sources.list.d/${SUITE}-proposed-updates.list
-    sudo apt update
+  Keep at least one EFI/ZBM-RECOVERY-* image after choosing a favourite.
 
 NEW BOOT ENVIRONMENTS
-  canmount is NOT inheritable. Set it explicitly or the system will try to
-  mount two filesystems at / and fail to boot:
+  canmount is not inherited; set it explicitly on every new environment:
     sudo zfs snapshot ${POOL_NAME}/ROOT/${BE_NAME}@pre-upgrade
     sudo zfs clone -o canmount=noauto -o mountpoint=/ \\
         ${POOL_NAME}/ROOT/${BE_NAME}@pre-upgrade ${POOL_NAME}/ROOT/new
 
-NEW USERS
-  useradd will NOT copy /etc/skel into a home directory that already exists,
-  and a per-user dataset makes it exist:
-    sudo zfs create -o mountpoint=/home/NAME ${POOL_NAME}/data/home/NAME
-    sudo useradd -M -d /home/NAME -s /bin/bash -G sudo NAME
-    sudo cp -a /etc/skel/. /home/NAME/
-    sudo chown -R NAME:NAME /home/NAME && sudo chmod 0750 /home/NAME
-    sudo passwd NAME
-
 POOL COMPATIBILITY
   Current profile: ${POOL_COMPAT}
-  Every ZFSBootMenu image you keep must support every feature allowed by this
-  profile. Check the selected release's notes rather than assuming its bundled
-  OpenZFS version.
+  Upgrade order: install one verified ZBM image -> boot and prove it -> replace
+  every remaining release/recovery/backup/fallback -> advance the pool:
+    target=openzfs-2.5-linux
+    test -r "/usr/share/zfs/compatibility.d/\${target}"
+    sudo zpool set compatibility="\${target}" ${POOL_NAME}
+    sudo zpool upgrade ${POOL_NAME}
 
-  To move the pool to a future OpenZFS profile:
-    1. Install one verified new release image; keep known-good fallbacks intact.
-    2. Boot through the new image and prove it imports this pool.
-    3. Replace every remaining release, recovery, backup and BOOTX64 image with
-       a verified image that supports the target profile.
-    4. Confirm the OS provides the target profile, then run:
-
-       target=openzfs-2.5-linux
-       test -r "/usr/share/zfs/compatibility.d/\${target}"
-       sudo zpool set compatibility="\${target}" ${POOL_NAME}
-       sudo zpool upgrade ${POOL_NAME}
-
-  Never advance compatibility until every ZBM image you might boot supports it.
+See README.md for packages, users, APT policy, recovery, and full upgrade notes.
 
 EOF

@@ -178,8 +178,10 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `COMPRESSION` | `lz4` | |
 | `DATASET_TUNING` | `yes` | |
 | `SUITE` / `MIRROR` | `trixie` / deb.debian.org | |
-| `COMPONENTS` | `main contrib non-free-firmware` | |
+| `COMPONENTS` | `main contrib non-free non-free-firmware` | |
+| `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites |
 | `ENABLE_BACKPORTS` | `yes` | `yes` adds the repo with Debian's native policy and seeds ZFS from it; `no` uses base Trixie |
+| `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
 | `ROOT_PASSWORD` / `ADMIN_PASSWORD` / `ZFS_PASSPHRASE` | prompted | Passing these on the command line leaks them to `ps` |
@@ -259,6 +261,20 @@ sudo usermod -a -G sudo NAME
 sudo passwd NAME
 ```
 
+### Optional fonts and printing
+
+The minimal desktop does not install the extended font set or printing stack:
+
+```bash
+sudo apt install fonts-noto-core fonts-noto-color-emoji fonts-liberation2 \
+    fonts-dejavu-core fonts-hack
+sudo apt install cups cups-filters cups-browsed avahi-daemon system-config-printer
+sudo usermod -a -G lpadmin USER
+```
+
+Install CUPS before adding the user to `lpadmin`; the group does not exist yet
+on a system without CUPS.
+
 ### Updating ZFSBootMenu
 
 Choose the release and kernel series you want to replace, then verify the
@@ -272,14 +288,11 @@ asset="zfsbootmenu-release-x86_64-${version}-linux${kernel}.EFI"
 base="https://github.com/zbm-dev/zfsbootmenu/releases/download/${version}"
 tmpdir="$(mktemp -d)"
 
-curl -fSL -o "${tmpdir}/sha256.txt" "${base}/sha256.txt"
 curl -fSL -o "${tmpdir}/sha256.sig" "${base}/sha256.sig"
 curl -fSL -o "${tmpdir}/${asset}" "${base}/${asset}"
 
-signify-openbsd -V -p /etc/signify/zfsbootmenu.pub \
-  -x "${tmpdir}/sha256.sig" -m "${tmpdir}/sha256.txt"
 (cd "$tmpdir" && signify-openbsd -C \
-  -p /etc/signify/zfsbootmenu.pub -x sha256.sig "$asset")
+  -p /etc/signify/zfsbootmenu.pub -x sha256.sig "$asset") &&
 
 sudo install -m 0644 "${tmpdir}/${asset}" \
   "/boot/efi/EFI/ZBM-${kernel}/vmlinuz.EFI"
