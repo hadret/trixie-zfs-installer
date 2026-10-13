@@ -134,22 +134,20 @@ POOL/data                       mountpoint=none   canmount=off
 ├── srv                         /srv
 └── var                         (container, canmount=off)
     ├── lib                     (container, canmount=off)
-    │   ├── containers          /var/lib/containers      Podman
-    │   ├── docker              /var/lib/docker          Docker
-    │   ├── libvirt             /var/lib/libvirt         VMs
-    │   └── lxc                 /var/lib/lxc             LXC
+    │   ├── containerd          /var/lib/containerd      containerd
+    │   └── docker              /var/lib/docker          Docker
     ├── log                     /var/log
     ├── spool                   /var/spool
     └── tmp                     /var/tmp
 ```
 
-The `ROOT`/`data` split is what makes boot environments useful: rolling back `ROOT/default` reverts the OS without touching home directories, logs, or VM images.
+The `ROOT`/`data` split is what makes boot environments useful: rolling back `ROOT/default` reverts the OS without touching home directories, logs, or container data.
 
-The container and VM datasets exist but **no daemons are installed**. Install `docker.io`, `podman`, `libvirt-daemon-system` or `lxc` when you need them and they land on their own datasets automatically.
+The Docker and containerd datasets exist but **no daemons are installed**; `docker.io` (rootful, as OhMyDebn installs it) lands on them automatically. OhMyDebn's Podman and Distrobox are rootless and its virt-manager uses `qemu:///session`, so their images live under the user's home dataset instead.
 
 ### Optional tuning
 
-With `DATASET_TUNING=yes` (the default), the script applies a light, conservative set of properties: `atime=off` across `data/var`, `setuid=off devices=off` on `/var/tmp`, `compression=zstd recordsize=64K` on `/var/log`, `recordsize=64K` on libvirt, `32K` on the container stores, and `com.sun:auto-snapshot=false` on the container/VM datasets. Set `DATASET_TUNING=no` to inherit pool defaults everywhere and tune it yourself.
+With `DATASET_TUNING=yes` (the default), the script applies a light, conservative set of properties: `setuid=off devices=off` on `/var/tmp`, `compression=zstd recordsize=64K` on `/var/log`, and `recordsize=32K` plus `com.sun:auto-snapshot=false` on `/var/lib/docker`. (`atime=off` is set pool-wide regardless.) Set `DATASET_TUNING=no` to inherit pool defaults everywhere and tune it yourself.
 
 ---
 
