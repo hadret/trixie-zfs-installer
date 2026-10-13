@@ -67,7 +67,7 @@ sudo -i
 apt update && apt install -y git
 git clone https://github.com/hadret/trixie-zfs-installer.git
 cd trixie-zfs-installer
-chmod +x *.sh
+chmod +x debian13-zbm-install.sh
 ```
 
 **Find your disk.** Run the script with no `DISK` set and it lists the candidates and exits:
@@ -84,7 +84,7 @@ chmod +x *.sh
 ```bash
 DISK=/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S1A2B3C4 \
 TARGET_HOSTNAME=workstation \
-ADMIN_USER=alireza \
+ADMIN_USER=hadret \
 TIMEZONE=Europe/Berlin \
 DESKTOP=minimal \
 ./debian13-zbm-install.sh
@@ -183,6 +183,9 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
+| `DESKTOP_EXTRAS` | `yes` | Session integration, audio, Bluetooth, codecs, archives, hardware services, Firefox ESR |
+| `INSTALL_MEDIA_ACCEL` / `INSTALL_FLATPAK` / `INSTALL_OFFICE` | `yes` / `no` / `no` | Video acceleration, Flatpak, LibreOffice (with `DESKTOP_EXTRAS=yes`) |
+| `INSTALL_UNATTENDED_UPGRADES` | `no` | |
 | `ADMIN_PASSWORD` | prompted | Minimum 8 characters; also used for the encrypted pool unless overridden. Passing it on the command line leaks it to `ps` |
 | `ZFS_PASSPHRASE` | `ADMIN_PASSWORD` when encrypted | Minimum 8 characters; set it separately when the admin password is not easy to type with ZFSBootMenu's US keymap. Ignored when `ENCRYPTION=no` |
 | `ROOT_PASSWORD` | — | Empty leaves the root account locked; a supplied value must be at least 8 characters |
@@ -192,8 +195,14 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `SWAP_MODE` | `random` | `random`, `luks`, `none`; `none` omits the partition and normalizes its size to `0` |
 | `ZBM_CMDLINE` | `loglevel=6` | ZFSBootMenu's **own** kernel command line |
 | `KERNEL_CMDLINE` | `loglevel=6 systemd.show_status=yes` | What ZBM passes to Debian |
-| `ZBM_TIMEOUT` | `10` | Countdown before booting `bootfs` |
-| `ZBM_FALLBACK` | `yes` | Also install to `EFI/BOOT/BOOTX64.EFI` |
+| `ZBM_TIMEOUT` | `30` | ZFSBootMenu countdown before booting `bootfs`; `0` boots immediately, `-1` waits forever |
+| `ZBM_VERSION` | `v3.1.0` | Pinned release; other versions need an explicit `POOL_COMPAT` |
+| `ZBM_KERNELS` | `all` | Kernel series to install images for: `all` (`6.6 6.12 6.18`), one, or a space-separated subset |
+| `ZBM_RECOVERY` | `yes` | Also install the recovery image for each kernel |
+| `ZBM_BACKUP` | `yes` | Keep a copy of each release image under `EFI/ZBM-BACKUP` |
+| `ZBM_FALLBACK_KERNEL` | `6.12` | Release image copied to `EFI/BOOT/BOOTX64.EFI` if `refind-install` left it empty; empty disables |
+| `REFIND_TIMEOUT` | `30` | rEFInd menu timeout in seconds; `0` waits indefinitely |
+| `REFIND_DEFAULT` | — | rEFInd `default_selection` (a substring of the entry title, e.g. `ZBM-6.12`); empty highlights the first entry |
 | `ENCRYPTION_ALGO` | `aes-256-gcm` | |
 | `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.4-linux` with backports, `openzfs-2.3-linux` without; `off` disables the pin |
 
