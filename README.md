@@ -9,7 +9,7 @@ The script:
 - build the **same dataset hierarchy** with separate datasets for `/home`, `/root`, `/opt`, `/srv`, `/var/log`, `/var/spool`, `/var/tmp` and the container/VM stores
 - create a `default` and a `baseline` boot environment
 - install a **1 GiB encrypted swap partition** with a fresh random key each boot
-- install **Cinnamon** (the base for [OhMyDebn](https://github.com/dougburks/ohmydebn)), minimal or full, or nothing — with LightDM autologin for the admin user on encrypted installs
+- install **LMDE 7 with Cinnamon** by default (the base for [OhMyDebn](https://github.com/dougburks/ohmydebn)), Debian Cinnamon minimal/full, or no desktop — with LightDM autologin for the admin user on encrypted installs
 - install CPU microcode and a broad firmware set (including `firmware-iwlwifi`)
 - leave boot messages **visible** — `quiet` is not set anywhere
 
@@ -164,7 +164,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `LOCALE` | `en_US.UTF-8` | Must be UTF-8; `en_US.UTF-8` generated regardless |
 | `KEYMAP` | inherited from live ISO | Validated against the XKB rules list |
 | `KEYBOARD_VARIANT` | inherited from live ISO | Empty = standard layout. Pass `KEYBOARD_VARIANT=` to force none |
-| `DESKTOP` | `minimal` | Cinnamon `minimal` or `full`, or `none` for headless |
+| `DESKTOP` | `lmde` | `lmde` converts the target base to LMDE 7; `minimal` / `full` install Debian Cinnamon; `none` is headless Debian |
 | `AUTOLOGIN` | `yes` if encrypted | LightDM autologin for `ADMIN_USER`. **Forced to `no` on unencrypted pools**; with encryption, the ZBM passphrase already gates the machine |
 | `SWAP_SIZE_MIB` | `1024` | `0` disables swap entirely and normalizes `SWAP_MODE` to `none` |
 | `SWAP_RANDOM_SOURCE` | `/dev/urandom` | See [note on swap](#a-note-on-random-key-swap) |
@@ -176,15 +176,15 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `COMPRESSION` | `lz4` | |
 | `DATASET_TUNING` | `yes` | |
 | `ENCRYPTION` | `yes` | `no` creates an unencrypted pool and does not prompt for or install a ZFS key |
-| `SUITE` / `MIRROR` | `trixie` / deb.debian.org | |
+| `SUITE` / `MIRROR` | `trixie` / deb.debian.org | `DESKTOP=lmde` requires `trixie` and uses LMDE's official target mirrors; `MIRROR` remains the live-environment mirror |
 | `COMPONENTS` | `main contrib non-free non-free-firmware` | |
-| `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites |
+| `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites; both must remain `yes` with `DESKTOP=lmde` |
 | `BACKPORTS` | `zfs` | `none` keeps stable packages; `zfs` pins only `src:zfs-linux` to backports; `full` prefers backports system-wide while keeping the kernel on stable |
-| `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority |
+| `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority; must remain `no` with `DESKTOP=lmde` |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
-| `DESKTOP_EXTRAS` | `yes` | Session integration, audio, Bluetooth, codecs, archives, hardware services, Firefox ESR |
-| `INSTALL_MEDIA_ACCEL` / `INSTALL_FLATPAK` / `INSTALL_OFFICE` | `yes` / `no` / `no` | Video acceleration, Flatpak, LibreOffice (with `DESKTOP_EXTRAS=yes`) |
+| `DESKTOP_EXTRAS` | `yes` | Session integration, audio, Bluetooth, codecs, archives, hardware services and a browser; LMDE uses `mint-meta-codecs` and Mint Firefox |
+| `INSTALL_MEDIA_ACCEL` / `INSTALL_FLATPAK` / `INSTALL_OFFICE` | `yes` / `no` / `no` | Video acceleration, Flatpak, LibreOffice (with `DESKTOP_EXTRAS=yes`); LMDE already gets Flatpak and mintinstall through its meta package |
 | `INSTALL_UNATTENDED_UPGRADES` | `no` | |
 | `ADMIN_PASSWORD` | prompted | Minimum 8 characters; also used for the encrypted pool unless overridden. Passing it on the command line leaks it to `ps` |
 | `ZFS_PASSPHRASE` | `ADMIN_PASSWORD` when encrypted | Minimum 8 characters; set it separately when the admin password is not easy to type with ZFSBootMenu's US keymap. Ignored when `ENCRYPTION=no` |
@@ -207,6 +207,15 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `POOL_COMPAT` | derived | `v3.1.0` → `openzfs-2.3-linux` with `BACKPORTS=none`, `openzfs-2.4-linux` with `zfs` or `full`; `off` disables the pin |
 
 > Password variables are intended for controlled unattended installs. Supplying them inline with the command can expose them to process inspection.
+
+`DESKTOP=lmde` is a base-system choice, not just a theme or package set. The
+installer keeps the live environment on Debian, then gives the target LMDE 7's
+official `gigi` repository layout and upstream preference, installs Mint's
+`base-files` and `mint-meta-cinnamon`, configures Flathub explicitly, and
+verifies that no GRUB bootloader package was introduced. The vendored Mint
+archive key is checksum-verified before the disk is touched. Mint's own
+`mintsystem` package owns its extra-repository preference; the ZFS backports
+policy remains in a separate file that mintsources does not manage.
 
 > **`ZBM_CMDLINE` and `KERNEL_CMDLINE` are not the same thing.** The first configures ZFSBootMenu's own kernel (what you see while it imports the pool and asks for the passphrase). The second is stored in `org.zfsbootmenu:commandline` and configures Debian. Conflating them is the most common mistake with this setup.
 
