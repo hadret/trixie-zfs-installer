@@ -6,6 +6,23 @@
 
 set -euo pipefail
 
+PRINT_CONFIG=no
+PRINT_OPTIONS=""
+case "${1:-}" in
+--print-config)
+  PRINT_CONFIG=yes
+  shift
+  ;;
+--print-options)
+  [[ $# -ge 2 ]] || { printf '%s\n' "--print-options requires a variable name" >&2; exit 2; }
+  PRINT_OPTIONS="$2"
+  shift 2
+  ;;
+"") ;;
+*) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+esac
+(( $# == 0 )) || { printf 'Unexpected argument: %s\n' "$1" >&2; exit 2; }
+
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 ZBM_PUBKEY_SOURCE="${SCRIPT_DIR}/releng/zfsbootmenu.pub"
@@ -202,6 +219,44 @@ die() {
   exit 1
 }
 
+validate_yes_no() {
+  local name="$1" value="${!1}"
+  case "$value" in yes | no) ;; *) die "${name} must be yes or no." ;; esac
+}
+
+print_config() {
+  local name
+  local -a names=(
+    DISK
+    ZBM_VERSION ZBM_BASE_URL ZBM_KERNELS ZBM_RECOVERY ZBM_BACKUP ZBM_FALLBACK_KERNEL
+    REFIND_TIMEOUT REFIND_DEFAULT ZBM_CMDLINE KERNEL_CMDLINE ZBM_TIMEOUT
+    ESP_SIZE_MIB SWAP_SIZE_MIB SWAP_MODE SWAP_RANDOM_SOURCE SWAP_CIPHER SWAP_KEYSIZE SWAP_MAPPER
+    INSTALL_CRYPTSETUP_INITRAMFS
+    POOL_NAME BE_NAME BASELINE_NAME BASELINE_MODE ASHIFT COMPRESSION ENCRYPTION ENCRYPTION_ALGO
+    DATASET_TUNING POOL_COMPAT
+    TARGET_HOSTNAME ADMIN_USER ADMIN_FULLNAME ADMIN_GROUPS
+    TIMEZONE LOCALE KEYMAP KEYBOARD_VARIANT
+    SUITE MIRROR SECURITY_MIRROR COMPONENTS ENABLE_UPDATES ENABLE_SECURITY BACKPORTS
+    ENABLE_CHABIK_REPO ENABLE_PROPOSED_UPDATES INSTALL_FIRMWARE EXTRA_PACKAGES
+    DESKTOP AUTOLOGIN DESKTOP_EXTRAS INSTALL_MEDIA_ACCEL INSTALL_FLATPAK INSTALL_OFFICE
+    INSTALL_UNATTENDED_UPGRADES HOSTID
+  )
+  for name in "${names[@]}"; do
+    printf '%s=%q\n' "$name" "${!name}"
+  done
+}
+
+print_options() {
+  case "$1" in
+  AUTOLOGIN | ENCRYPTION) printf '%s\n' yes no ;;
+  BACKPORTS) printf '%s\n' none zfs full ;;
+  BASELINE_MODE) printf '%s\n' clone send none ;;
+  DESKTOP) printf '%s\n' lmde minimal full none ;;
+  SWAP_MODE) printf '%s\n' random luks none ;;
+  *) die "No option list is defined for $1." ;;
+  esac
+}
+
 # Failure cleanup is ownership-driven: these markers are set only after this
 # run creates each resource, so the trap cannot touch an unrelated /mnt or pool.
 INSTALL_POOL_CREATED=no
@@ -297,14 +352,24 @@ list_disks() {
 }
 
 #==============================================================================
-# Preflight
+# Configuration validation
 #==============================================================================
 
-[[ $EUID -eq 0 ]] || die "Run this script as root (sudo -i)."
-[[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
+if [[ -n "$PRINT_OPTIONS" ]]; then
+  print_options "$PRINT_OPTIONS"
+  exit 0
+fi
+
+for _boolean in \
+  ZBM_RECOVERY ZBM_BACKUP INSTALL_CRYPTSETUP_INITRAMFS DATASET_TUNING \
+  ENCRYPTION ENABLE_UPDATES ENABLE_SECURITY ENABLE_CHABIK_REPO \
+  ENABLE_PROPOSED_UPDATES INSTALL_FIRMWARE AUTOLOGIN DESKTOP_EXTRAS \
+  INSTALL_MEDIA_ACCEL INSTALL_FLATPAK INSTALL_OFFICE INSTALL_UNATTENDED_UPGRADES \
+  FORCE; do
+  validate_yes_no "$_boolean"
+done
 
 case "$BACKPORTS" in none | zfs | full) ;; *) die "BACKPORTS must be none, zfs or full." ;; esac
-case "$ENABLE_CHABIK_REPO" in yes | no) ;; *) die "ENABLE_CHABIK_REPO must be yes or no." ;; esac
 if [[ "$ENABLE_CHABIK_REPO" == "yes" && "$SUITE" != "trixie" ]]; then
   die "ENABLE_CHABIK_REPO=yes currently requires SUITE=trixie."
 fi
@@ -326,50 +391,21 @@ if [[ -z "$POOL_COMPAT" ]]; then
   esac
 fi
 
-if [[ -z "$DISK" ]]; then
-  list_disks
-  die "DISK is not set. Pass a /dev/disk/by-id/... path."
-fi
-if [[ "$DISK" != /dev/disk/by-id/* ]]; then
-  list_disks
+if [[ -n "$DISK" && "$DISK" != /dev/disk/by-id/* ]]; then
   die "DISK must be a /dev/disk/by-id/... path (got: ${DISK})."
 fi
-if [[ "$DISK" == *-part* ]]; then
+if [[ -n "$DISK" && "$DISK" == *-part* ]]; then
   die "DISK must point at a whole disk, not a partition."
 fi
-if [[ ! -b "$DISK" ]]; then
-  list_disks
-  die "${DISK} is not a block device."
-fi
-
-DISK_REAL="$(readlink -f "$DISK")"
-[[ "$(lsblk -dno TYPE "$DISK_REAL")" == "disk" ]] || die "${DISK} does not resolve to a whole disk."
-
-SECURE_BOOT_EFIVAR="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-# SecureBoot is the byte after EFI's four-byte attribute header; missing is fine.
-if [[ -r "$SECURE_BOOT_EFIVAR" ]] &&
-  [[ "$(od -An -tu1 -j4 -N1 "$SECURE_BOOT_EFIVAR" | tr -d '[:space:]')" == "1" ]]; then
-  die "Secure Boot is enabled. The unsigned ZFSBootMenu EFI images will not boot; disable Secure Boot and retry."
-fi
-
-[[ -r "$ZBM_PUBKEY_SOURCE" ]] ||
-  die "Missing vendored ZFSBootMenu signing key: ${ZBM_PUBKEY_SOURCE}"
 
 case "$DESKTOP" in lmde | minimal | full | none) ;; *) die "DESKTOP must be lmde, minimal, full or none." ;; esac
 if [[ "$DESKTOP" == "lmde" ]]; then
   [[ "$SUITE" == "trixie" ]] || die "DESKTOP=lmde requires SUITE=trixie (LMDE 7 gigi)."
   [[ "$ENABLE_UPDATES" == "yes" && "$ENABLE_SECURITY" == "yes" && "$ENABLE_PROPOSED_UPDATES" == "no" ]] ||
     die "DESKTOP=lmde requires the official LMDE suite layout: updates/security enabled and proposed-updates disabled."
-  [[ -r "$MINT_KEY_SOURCE" ]] || die "Missing vendored Linux Mint signing key: ${MINT_KEY_SOURCE}"
-  [[ "$(sha256sum "$MINT_KEY_SOURCE" | awk '{print $1}')" == "$MINT_KEY_SHA256" ]] ||
-    die "Vendored Linux Mint signing key checksum does not match the verified LMDE 7 key."
-  [[ -r "${LMDE_RELENG_DIR}/official-package-repositories.pref" ]] ||
-    die "Missing vendored LMDE APT policy: ${LMDE_RELENG_DIR}/official-package-repositories.pref"
 fi
-case "$AUTOLOGIN" in yes | no) ;; *) die "AUTOLOGIN must be yes or no." ;; esac
 case "$BASELINE_MODE" in clone | send | none) ;; *) die "BASELINE_MODE must be clone, send or none." ;; esac
 case "$SWAP_MODE" in random | luks | none) ;; *) die "SWAP_MODE must be random, luks or none." ;; esac
-case "$ENCRYPTION" in yes | no) ;; *) die "ENCRYPTION must be yes or no." ;; esac
 if [[ "$ENCRYPTION" == "no" || "$DESKTOP" == "none" ]]; then
   if [[ "$AUTOLOGIN_EXPLICIT" == "yes" && "$AUTOLOGIN" == "yes" ]]; then
     warn "AUTOLOGIN=yes ignored: autologin requires an encrypted desktop install."
@@ -505,6 +541,47 @@ if [[ -r /usr/share/i18n/SUPPORTED ]]; then
     warn "LOCALE='${LOCALE}' not listed in /usr/share/i18n/SUPPORTED; locale-gen may fail."
 fi
 
+if [[ "$PRINT_CONFIG" == yes ]]; then
+  print_config
+  exit 0
+fi
+
+#==============================================================================
+# Machine and repository preflight
+#==============================================================================
+
+[[ $EUID -eq 0 ]] || die "Run this script as root (sudo -i)."
+[[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
+
+if [[ -z "$DISK" ]]; then
+  list_disks
+  die "DISK is not set. Pass a /dev/disk/by-id/... path."
+fi
+if [[ ! -b "$DISK" ]]; then
+  list_disks
+  die "${DISK} is not a block device."
+fi
+
+DISK_REAL="$(readlink -f "$DISK")"
+[[ "$(lsblk -dno TYPE "$DISK_REAL")" == "disk" ]] || die "${DISK} does not resolve to a whole disk."
+
+SECURE_BOOT_EFIVAR="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+# SecureBoot is the byte after EFI's four-byte attribute header; missing is fine.
+if [[ -r "$SECURE_BOOT_EFIVAR" ]] &&
+  [[ "$(od -An -tu1 -j4 -N1 "$SECURE_BOOT_EFIVAR" | tr -d '[:space:]')" == "1" ]]; then
+  die "Secure Boot is enabled. The unsigned ZFSBootMenu EFI images will not boot; disable Secure Boot and retry."
+fi
+
+[[ -r "$ZBM_PUBKEY_SOURCE" ]] ||
+  die "Missing vendored ZFSBootMenu signing key: ${ZBM_PUBKEY_SOURCE}"
+if [[ "$DESKTOP" == "lmde" ]]; then
+  [[ -r "$MINT_KEY_SOURCE" ]] || die "Missing vendored Linux Mint signing key: ${MINT_KEY_SOURCE}"
+  [[ "$(sha256sum "$MINT_KEY_SOURCE" | awk '{print $1}')" == "$MINT_KEY_SHA256" ]] ||
+    die "Vendored Linux Mint signing key checksum does not match the verified LMDE 7 key."
+  [[ -r "${LMDE_RELENG_DIR}/official-package-repositories.pref" ]] ||
+    die "Missing vendored LMDE APT policy: ${LMDE_RELENG_DIR}/official-package-repositories.pref"
+fi
+
 #--- Partition devices --------------------------------------------------------
 BOOT_PART=1
 SWAP_PART=2
@@ -560,6 +637,7 @@ if [[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]]; then
   warn "packages queued for the next point release WILL be installed on upgrade."
 fi
 
+echo "Current contents of the disk (will be destroyed):"
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK_REAL" || true
 
 if [[ "$FORCE" != "yes" ]]; then

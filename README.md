@@ -54,6 +54,7 @@ ZFSBootMenu is a small Linux+initramfs bundled into a single EFI executable. It 
 - A **whole disk** to erase — this script is not for dual-booting
 - A **Debian 13 Live ISO**, booted in UEFI mode
 - Working internet in the live environment
+- [`gum`](https://github.com/charmbracelet/gum) for the guided installer (the core installer does not need it)
 - ≥ 4 GiB RAM recommended (ZFS is slow below 2 GiB)
 - Patience: `zfs-dkms` compiles in the live environment, which takes several minutes before anything visible happens
 
@@ -64,33 +65,47 @@ ZFSBootMenu is a small Linux+initramfs bundled into a single EFI executable. It 
 ```bash
 # In the live environment
 sudo -i
-apt update && apt install -y git
+apt update && apt install -y git gum
 git clone https://github.com/hadret/trixie-zfs-installer.git
 cd trixie-zfs-installer
-chmod +x debian13-zbm-install.sh
 ```
 
-**Find your disk.** Run the script with no `DISK` set and it lists the candidates and exits:
+**Run the guided installer:**
 
 ```bash
-./debian13-zbm-install.sh
-# Whole disks under /dev/disk/by-id/:
-#   /dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S1A2B3C4    931.5G Samsung SSD 990 PRO
-#   /dev/disk/by-id/ata-CT1000MX500SSD1_2015E2A0B1C2          931.5G CT1000MX500SSD1
+./zbm-installer.sh
 ```
 
-**Install:**
+The wrapper asks only for the machine-specific choices, shows where every value
+came from, and writes the complete non-secret result to `install.env`. Passwords
+and the final typed `ERASE` confirmation remain inside the core installer and
+are never saved. Re-running the wrapper loads `install.env`; exported environment
+variables take precedence over that file.
+
+Use `./zbm-installer.sh --dry-run` to prepare `install.env` on another machine.
+It skips the root and local-disk requirements, accepts the future target's
+`/dev/disk/by-id/…` path as text, runs the remaining pickers and review, writes
+the file, prints the command it would hand off to, and exits. It requires an
+interactive terminal and `gum`; `NONINTERACTIVE=yes` does not suppress this
+explicitly requested walkthrough.
+
+To bypass the TUI, set `NONINTERACTIVE=yes`. A disk is still required:
 
 ```bash
+NONINTERACTIVE=yes \
 DISK=/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S1A2B3C4 \
 TARGET_HOSTNAME=workstation \
 ADMIN_USER=hadret \
 TIMEZONE=Europe/Berlin \
-DESKTOP=minimal \
-./debian13-zbm-install.sh
+./zbm-installer.sh
 ```
 
-The script prints a full configuration summary, then requires you to type `ERASE` before touching the disk. It prompts once for the admin password and, by default, also uses it as the encrypted-pool passphrase. Set `ZFS_PASSPHRASE` to keep those credentials separate. The root account is locked unless `ROOT_PASSWORD` is supplied.
+For direct or unattended use, `debian13-zbm-install.sh` remains the authoritative
+installer. `--print-config` validates and prints its resolved configuration
+without inspecting hardware, and `--print-options VARIABLE` exposes picker
+choices without duplicating them in the wrapper.
+
+The installer prints a full configuration summary, then requires you to type `ERASE` before touching the disk. It prompts once for the admin password and, by default, also uses it as the encrypted-pool passphrase. Set `ZFS_PASSPHRASE` to keep those credentials separate. The root account is locked unless `ROOT_PASSWORD` is supplied.
 
 ### Not sure about the keyboard layout?
 
@@ -192,6 +207,8 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `ROOT_PASSWORD` | — | Empty leaves the root account locked; a supplied value must be at least 8 characters |
 | `FORCE` | `no` | `yes` skips **only** the `ERASE` confirmation |
 | `LIST_KEYBOARD` | — | List variants and exit |
+| `NONINTERACTIVE` | `no` | Wrapper only: skip gum and use environment / `install.env` values |
+| `CONFIG_FILE` | `./install.env` | Wrapper only: saved non-secret configuration path |
 | `ESP_SIZE_MIB` | `2048` | |
 | `SWAP_MODE` | `random` | `random`, `luks`, `none`; `none` omits the partition and normalizes its size to `0` |
 | `ZBM_CMDLINE` | `loglevel=6` | ZFSBootMenu's **own** kernel command line |
