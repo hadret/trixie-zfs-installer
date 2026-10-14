@@ -13,6 +13,9 @@ MINT_KEY_SOURCE="${SCRIPT_DIR}/releng/linuxmint.key.asc"
 LMDE_RELENG_DIR="${SCRIPT_DIR}/releng/lmde"
 # Primary fingerprint: 302F 0738 F465 C153 5761 F965 A661 6109 451B BBF2
 MINT_KEY_SHA256="db1de1f30394a2006a1b1bccf2abf448b3be05d8fdd709273b7e1e989a936546"
+CHABIK_KEY_URL="https://deb.chabik.com/debian/keyring.pgp"
+CHABIK_KEY_FINGERPRINT="3637EE588760A8326A43E02ACB847CE6C5E0EE3F"
+CHABIK_KEY_TMP="/run/chabik-archive-keyring.pgp"
 
 #==============================================================================
 # Keyboard detection from the live environment
@@ -153,6 +156,7 @@ COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
 ENABLE_UPDATES="${ENABLE_UPDATES:-yes}"     # ${SUITE}-updates
 ENABLE_SECURITY="${ENABLE_SECURITY:-yes}"   # ${SUITE}-security
 BACKPORTS="${BACKPORTS:-zfs}"               # none | zfs | full
+ENABLE_CHABIK_REPO="${ENABLE_CHABIK_REPO:-no}"
 # proposed-updates has normal priority and may be selected on upgrade.
 ENABLE_PROPOSED_UPDATES="${ENABLE_PROPOSED_UPDATES:-no}"
 
@@ -300,6 +304,10 @@ list_disks() {
 [[ -d /sys/firmware/efi ]] || die "Not booted in UEFI mode. This script is UEFI-only."
 
 case "$BACKPORTS" in none | zfs | full) ;; *) die "BACKPORTS must be none, zfs or full." ;; esac
+case "$ENABLE_CHABIK_REPO" in yes | no) ;; *) die "ENABLE_CHABIK_REPO must be yes or no." ;; esac
+if [[ "$ENABLE_CHABIK_REPO" == "yes" && "$SUITE" != "trixie" ]]; then
+  die "ENABLE_CHABIK_REPO=yes currently requires SUITE=trixie."
+fi
 if [[ "$BACKPORTS" == "full" ]]; then
   warn "BACKPORTS=full selects newer backports packages system-wide; the kernel stays on stable for ZFS compatibility."
 fi
@@ -544,6 +552,7 @@ cat <<EOF
   Components       : ${COMPONENTS}
   Suites           : ${SUITE}$([[ "$ENABLE_UPDATES" == yes ]] && echo " +updates")$([[ "$ENABLE_SECURITY" == yes ]] && echo " +security") +backports$([[ "$ENABLE_PROPOSED_UPDATES" == yes ]] && echo " +proposed-updates")
   Backports mode   : ${BACKPORTS}$([[ "$BACKPORTS" == full ]] && echo "  WARNING: system-wide; stable kernel pinned")
+  deb.chabik.com   : ${ENABLE_CHABIK_REPO}
 EOF
 
 if [[ "$ENABLE_PROPOSED_UPDATES" == "yes" ]]; then
@@ -642,6 +651,51 @@ write_lmde_apt_layout() {
     "${root}/etc/apt/preferences.d/official-package-repositories.pref"
 }
 
+fetch_chabik_key() {
+  local part="${CHABIK_KEY_TMP}.part" gnupg_home key_listing
+  local -a primary_fingerprints=()
+  curl -fsSL --retry 3 --retry-delay 2 -o "$part" "$CHABIK_KEY_URL"
+  gnupg_home="$(mktemp -d)"
+  if ! key_listing="$(gpg --batch --homedir "$gnupg_home" --with-colons --show-keys "$part")"; then
+    rm -rf -- "$gnupg_home"
+    rm -f "$part"
+    die "Could not inspect the deb.chabik.com signing key."
+  fi
+  rm -rf -- "$gnupg_home"
+  mapfile -t primary_fingerprints < <(
+    awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }' <<<"$key_listing"
+  )
+  [[ ${#primary_fingerprints[@]} -eq 1 &&
+    "${primary_fingerprints[0]}" == "$CHABIK_KEY_FINGERPRINT" ]] || {
+    rm -f "$part"
+    die "deb.chabik.com signing-key fingerprint mismatch."
+  }
+  mv -f "$part" "$CHABIK_KEY_TMP"
+}
+
+write_chabik_repo() {
+  local root="$1"
+  install -D -m 0644 "$CHABIK_KEY_TMP" \
+    "${root}/usr/share/keyrings/chabik-archive-keyring.pgp"
+  install -D -m 0644 /dev/stdin \
+    "${root}/etc/apt/sources.list.d/chabik-trixie.sources" <<'EOF'
+# deb.chabik.com packages for Debian 13 (trixie)
+Types: deb
+URIs: https://deb.chabik.com/debian
+Suites: trixie
+Components: main
+Enabled: yes
+Signed-By: /usr/share/keyrings/chabik-archive-keyring.pgp
+
+Types: deb-src
+URIs: https://deb.chabik.com/debian
+Suites: trixie
+Components: main
+Enabled: no
+Signed-By: /usr/share/keyrings/chabik-archive-keyring.pgp
+EOF
+}
+
 #==============================================================================
 # [GUIDE] Configure Live Environment
 #==============================================================================
@@ -654,9 +708,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt update
 
 log "Installing ZFS and helpers in the live environment (DKMS build, be patient)"
-apt install -y debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates
+live_packages=(debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates)
+[[ "$ENABLE_CHABIK_REPO" == "yes" ]] && live_packages+=(gpg)
+apt install -y "${live_packages[@]}"
 apt install -y zfsutils-linux zfs-dkms
 modprobe zfs || die "zfs module failed to load in the live environment."
+
+if [[ "$ENABLE_CHABIK_REPO" == "yes" ]]; then
+  log "Verifying the deb.chabik.com signing key"
+  fetch_chabik_key
+fi
 
 if [[ "$POOL_COMPAT" != "off" &&
   ! -r "/usr/share/zfs/compatibility.d/${POOL_COMPAT}" ]]; then
@@ -901,6 +962,10 @@ if [[ "$DESKTOP" == "lmde" ]]; then
   write_lmde_apt_layout /mnt
 else
   gen_sources target >/mnt/root/sources.list.new
+fi
+if [[ "$ENABLE_CHABIK_REPO" == "yes" ]]; then
+  write_chabik_repo /mnt
+  rm -f "$CHABIK_KEY_TMP"
 fi
 write_backports_pin /mnt
 install -D -m 0644 "$ZBM_PUBKEY_SOURCE" /mnt/etc/signify/zfsbootmenu.pub

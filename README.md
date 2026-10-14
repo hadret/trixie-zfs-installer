@@ -180,6 +180,7 @@ With `DATASET_TUNING=yes` (the default), the script applies a light, conservativ
 | `COMPONENTS` | `main contrib non-free non-free-firmware` | |
 | `ENABLE_UPDATES` / `ENABLE_SECURITY` | `yes` | Add the point-release and security suites; both must remain `yes` with `DESKTOP=lmde` |
 | `BACKPORTS` | `zfs` | `none` keeps stable packages; `zfs` pins only `src:zfs-linux` to backports; `full` prefers backports system-wide while keeping the kernel on stable |
+| `ENABLE_CHABIK_REPO` | `no` | Add Filip's Trixie repository from `deb.chabik.com` as a signed, scoped deb822 source; does not explicitly install or pin any package |
 | `ENABLE_PROPOSED_UPDATES` | `no` | Adds packages queued for the next point release at normal APT priority; must remain `no` with `DESKTOP=lmde` |
 | `INSTALL_FIRMWARE` | `yes` | Microcode + probed firmware set |
 | `EXTRA_PACKAGES` | — | Space-separated |
@@ -216,6 +217,12 @@ verifies that no GRUB bootloader package was introduced. The vendored Mint
 archive key is checksum-verified before the disk is touched. Mint's own
 `mintsystem` package owns its extra-repository preference; the ZFS backports
 policy remains in a separate file that mintsources does not manage.
+
+`ENABLE_CHABIK_REPO=yes` adds only the repository configuration. The signing
+key is downloaded and checked against its pinned primary fingerprint before the
+disk is touched, then installed under `/usr/share/keyrings`; the deb822 source
+uses `Signed-By` so the key is valid only for that repository. No package is
+installed or pinned from it automatically.
 
 > **`ZBM_CMDLINE` and `KERNEL_CMDLINE` are not the same thing.** The first configures ZFSBootMenu's own kernel (what you see while it imports the pool and asks for the passphrase). The second is stored in `org.zfsbootmenu:commandline` and configures Debian. Conflating them is the most common mistake with this setup.
 
